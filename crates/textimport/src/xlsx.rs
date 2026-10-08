@@ -3,7 +3,8 @@
 
 use designcraft_doc::{CharFormat, ParaFormat, Story, StoryId, Table};
 
-use crate::docx::{El, parse, part};
+use crate::archive::{open, part};
+use crate::docx::{El, parse};
 use crate::{ImportError, Imported};
 
 /// "B12" → (row 11, column 1).
@@ -18,12 +19,17 @@ fn cell_ref(r: &str) -> Option<(usize, usize)> {
 }
 
 /// The worksheet part of the first sheet (workbook order), via the workbook relationships.
-fn first_sheet(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<String> {
-    let wb = parse(&part(zip, "xl/workbook.xml")?).ok()?;
-    let rid = wb.child("sheets")?.els().find(|e| e.name == "sheet")?.attr("id")?.to_string();
-    let rels = parse(&part(zip, "xl/_rels/workbook.xml.rels")?).ok()?;
-    let target = rels.els().find(|r| r.attr("Id") == Some(rid.as_str()))?.attr("Target")?.trim_start_matches('/').to_string();
-    Some(if target.starts_with("xl/") { target } else { format!("xl/{target}") })
+fn first_sheet(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Result<Option<String>, ImportError> {
+    let Some(wb) = part(zip, "xl/workbook.xml")? else { return Ok(None) };
+    let wb = parse(&wb)?;
+    let Some(rid) = wb.child("sheets").and_then(|s| s.els().find(|e| e.name == "sheet")).and_then(|e| e.attr("id")) else {
+        return Ok(None);
+    };
+    let Some(rels) = part(zip, "xl/_rels/workbook.xml.rels")? else { return Ok(None) };
+    let rels = parse(&rels)?;
+    let Some(target) = rels.els().find(|r| r.attr("Id") == Some(rid)).and_then(|r| r.attr("Target")) else { return Ok(None) };
+    let target = target.trim_start_matches('/');
+    Ok(Some(if target.starts_with("xl/") { target.to_string() } else { format!("xl/{target}") }))
 }
 
 fn value(c: &El, shared: &[String]) -> String {
@@ -51,10 +57,10 @@ fn value(c: &El, shared: &[String]) -> String {
 }
 
 pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Corrupt(e.to_string()))?;
-    let sheet_part = first_sheet(&mut zip).unwrap_or_else(|| "xl/worksheets/sheet1.xml".into());
-    let sheet = parse(&part(&mut zip, &sheet_part).ok_or_else(|| ImportError::Corrupt(format!("no {sheet_part} (not an Excel workbook)")))?)?;
-    let shared: Vec<String> = part(&mut zip, "xl/sharedStrings.xml")
+    let mut zip = open(bytes)?;
+    let sheet_part = first_sheet(&mut zip)?.unwrap_or_else(|| "xl/worksheets/sheet1.xml".into());
+    let sheet = parse(&part(&mut zip, &sheet_part)?.ok_or_else(|| ImportError::Corrupt(format!("no {sheet_part} (not an Excel workbook)")))?)?;
+    let shared: Vec<String> = part(&mut zip, "xl/sharedStrings.xml")?
         .map(|x| parse(&x))
         .transpose()?
         .map(|sst| sst.els().filter(|e| e.name == "si").map(El::text).collect())

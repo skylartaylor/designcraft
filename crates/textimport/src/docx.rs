@@ -1,13 +1,25 @@
 //! Word (.docx, Office Open XML) → story.
 
-use std::collections::HashMap;
-use std::io::Read;
-
 use designcraft_doc::story::{BASIC_PARAGRAPH, NO_CHAR_STYLE};
 use designcraft_doc::{CharAttrs, CharFormat, ParaAttrs, ParaFormat, Story, StoryId, Table};
 use quick_xml::events::Event;
+use std::collections::HashMap;
 
+use crate::archive::{open, part};
 use crate::{ImportError, Imported, ImportedStyle};
+
+const MAX_XML_DEPTH: usize = 256;
+const MAX_XML_EVENTS: usize = 1_000_000;
+const MAX_XML_NODES: usize = 500_000;
+
+#[derive(Clone, Copy)]
+struct XmlLimits {
+    depth: usize,
+    events: usize,
+    nodes: usize,
+}
+
+const XML_LIMITS: XmlLimits = XmlLimits { depth: MAX_XML_DEPTH, events: MAX_XML_EVENTS, nodes: MAX_XML_NODES };
 
 /// A minimal element tree (local names, attributes by local name).
 #[derive(Debug, Default, Clone)]
@@ -57,29 +69,54 @@ fn local(n: &[u8]) -> String {
 }
 
 pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
+    parse_with_limits(xml, XML_LIMITS)
+}
+
+fn parse_with_limits(xml: &str, limits: XmlLimits) -> Result<El, ImportError> {
     let mut r = quick_xml::Reader::from_str(xml);
     let mut stack: Vec<El> = vec![El::default()];
+    let mut events = 0usize;
+    let mut nodes = 0usize;
     loop {
-        match r.read_event().map_err(|e| ImportError::Corrupt(e.to_string()))? {
+        let event = r.read_event().map_err(|e| ImportError::Corrupt(e.to_string()))?;
+        events = events.saturating_add(1);
+        if events > limits.events {
+            return Err(ImportError::Corrupt(format!("XML contains more than {} events", limits.events)));
+        }
+        match event {
             Event::Start(e) => {
+                if stack.len() > limits.depth {
+                    return Err(ImportError::Corrupt(format!("XML nesting exceeds {} elements", limits.depth)));
+                }
+                nodes = nodes.saturating_add(1);
+                if nodes > limits.nodes {
+                    return Err(ImportError::Corrupt(format!("XML contains more than {} nodes", limits.nodes)));
+                }
                 let el = El {
                     name: local(e.name().as_ref()),
                     attrs: e
                         .attributes()
                         .flatten()
-                        .map(|a| (local(a.key.as_ref()), a.unescape_value().map(|v| v.to_string()).unwrap_or_default()))
+                        .map(|a| (local(a.key.as_ref()), a.normalized_value(Default::default()).map(|v| v.to_string()).unwrap_or_default()))
                         .collect(),
                     kids: vec![],
                 };
                 stack.push(el);
             }
             Event::Empty(e) => {
+                if stack.len() > limits.depth {
+                    return Err(ImportError::Corrupt(format!("XML nesting exceeds {} elements", limits.depth)));
+                }
+                nodes = nodes.saturating_add(1);
+                if nodes > limits.nodes {
+                    return Err(ImportError::Corrupt(format!("XML contains more than {} nodes", limits.nodes)));
+                }
                 let el = El {
                     name: local(e.name().as_ref()),
                     attrs: e
                         .attributes()
                         .flatten()
-                        .map(|a| (local(a.key.as_ref()), a.unescape_value().map(|v| v.to_string()).unwrap_or_default()))
+                        .map(|a| (local(a.key.as_ref()), a.normalized_value(Default::default()).map(|v| v.to_string()).unwrap_or_default()))
                         .collect(),
                     kids: vec![],
                 };
@@ -88,6 +125,9 @@ pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
                 }
             }
             Event::End(_) => {
+                if stack.len() <= 1 {
+                    return Err(ImportError::Corrupt("XML contains an unexpected closing element".into()));
+                }
                 let el = stack.pop().unwrap_or_default();
                 match stack.last_mut() {
                     Some(p) => p.kids.push(Node::El(el)),
@@ -95,6 +135,10 @@ pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
                 }
             }
             Event::Text(t) => {
+                nodes = nodes.saturating_add(1);
+                if nodes > limits.nodes {
+                    return Err(ImportError::Corrupt(format!("XML contains more than {} nodes", limits.nodes)));
+                }
                 let s = t.decode().map(|s| s.to_string()).unwrap_or_default();
                 let s = quick_xml::escape::unescape(&s).map(|s| s.to_string()).unwrap_or(s);
                 if let Some(p) = stack.last_mut() {
@@ -102,6 +146,10 @@ pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
                 }
             }
             Event::GeneralRef(e) => {
+                nodes = nodes.saturating_add(1);
+                if nodes > limits.nodes {
+                    return Err(ImportError::Corrupt(format!("XML contains more than {} nodes", limits.nodes)));
+                }
                 let name = String::from_utf8_lossy(&e).to_string();
                 let s = match name.as_str() {
                     "amp" => "&".to_string(),
@@ -121,15 +169,14 @@ pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
             _ => {}
         }
     }
+    if stack.len() != 1 {
+        return Err(ImportError::Corrupt("XML ended before all elements were closed".into()));
+    }
     let mut root = stack.pop().unwrap_or_default();
-    Ok(root.kids.drain(..).find_map(|n| if let Node::El(e) = n { Some(e) } else { None }).unwrap_or_default())
-}
-
-pub(crate) fn part(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<String> {
-    let mut f = zip.by_name(name).ok()?;
-    let mut s = String::new();
-    f.read_to_string(&mut s).ok()?;
-    Some(s)
+    root.kids
+        .drain(..)
+        .find_map(|n| if let Node::El(e) = n { Some(e) } else { None })
+        .ok_or_else(|| ImportError::Corrupt("XML has no root element".into()))
 }
 
 /// Character attributes from `<w:rPr>`.
@@ -312,14 +359,14 @@ impl Ctx {
 }
 
 pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Corrupt(e.to_string()))?;
-    let doc = part(&mut zip, "word/document.xml").ok_or_else(|| ImportError::Corrupt("no word/document.xml (not a Word document)".into()))?;
+    let mut zip = open(bytes)?;
+    let doc = part(&mut zip, "word/document.xml")?.ok_or_else(|| ImportError::Corrupt("no word/document.xml (not a Word document)".into()))?;
     let doc = parse(&doc)?;
     // Styles.
     let mut ctx = Ctx { para_names: HashMap::new(), char_names: HashMap::new(), footnotes: HashMap::new(), warnings: vec![], next_table: 0 };
     let mut para_styles = Vec::new();
     let mut char_styles = Vec::new();
-    if let Some(styles) = part(&mut zip, "word/styles.xml").map(|s| parse(&s)).transpose()? {
+    if let Some(styles) = part(&mut zip, "word/styles.xml")?.map(|s| parse(&s)).transpose()? {
         let ids: HashMap<String, String> =
             styles.els().filter(|s| s.name == "style").filter_map(|s| Some((s.attr("styleId")?.to_string(), s.val("name")?))).collect();
         for s in styles.els().filter(|s| s.name == "style") {
@@ -351,7 +398,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
         }
     }
     // Footnotes (ids -1 / 0 are the separators).
-    if let Some(f) = part(&mut zip, "word/footnotes.xml").map(|s| parse(&s)).transpose()? {
+    if let Some(f) = part(&mut zip, "word/footnotes.xml")?.map(|s| parse(&s)).transpose()? {
         for n in f.els().filter(|n| n.name == "footnote") {
             if let Some(id) = n.attr("id").filter(|id| id.parse::<i64>().is_ok_and(|v| v > 0)) {
                 ctx.footnotes.insert(id.to_string(), n.clone());
@@ -442,5 +489,15 @@ mod tests {
         assert_eq!(i.para_styles[0].chars.size, Some(16.0));
         assert_eq!(i.para_styles[0].para.space_before, Some(12.0));
         assert_eq!(i.char_styles[0].chars.font_style.as_deref(), Some("Italic"));
+    }
+
+    #[test]
+    fn xml_resource_limits_cover_depth_event_and_node_counts() {
+        let limits = |depth, events, nodes| XmlLimits { depth, events, nodes };
+
+        assert!(parse_with_limits("<a><b><c/></b></a>", limits(2, 20, 20)).is_err());
+        assert!(parse_with_limits("<a><b/><c/></a>", limits(10, 3, 20)).is_err());
+        assert!(parse_with_limits("<a>one<b/>two</a>", limits(10, 20, 3)).is_err());
+        assert!(parse_with_limits("<a><b/></a>", limits(2, 4, 2)).is_ok());
     }
 }
