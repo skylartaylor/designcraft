@@ -38,12 +38,8 @@ pub fn import(bytes: &[u8], dir: Option<&std::path::Path>) -> Result<Document> {
     let read = move |link: &str| -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Ok(b) = std::fs::read(link) {
-                return Some(b);
-            }
-            let name = link.rsplit(['/', '\\']).next()?;
             let dir = dir.as_ref()?;
-            std::fs::read(dir.join(name)).or_else(|_| std::fs::read(dir.join("Links").join(name))).ok()
+            read_link_beside_idml(dir, link, designcraft_idml::MAX_LINKED_RESOURCE_BYTES)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -52,6 +48,43 @@ pub fn import(bytes: &[u8], dir: Option<&std::path::Path>) -> Result<Document> {
         }
     };
     designcraft_idml::import_idml_with(bytes, &read).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_link_beside_idml(dir: &std::path::Path, link: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::path::{Component, Path};
+
+    let relative = Path::new(link);
+    if relative.as_os_str().is_empty() || !relative.components().all(|component| matches!(component, Component::Normal(_))) {
+        return None;
+    }
+    let root = std::fs::canonicalize(dir).ok()?;
+    let name = relative.file_name()?;
+    let candidates = [root.join(relative), root.join("Links").join(relative), root.join("Links").join(name)];
+    for candidate in candidates {
+        let Ok(canonical) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !canonical.starts_with(&root) {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(canonical) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > max_bytes {
+            continue;
+        }
+        let capacity = usize::try_from(metadata.len()).ok()?;
+        let mut data = Vec::with_capacity(capacity);
+        if file.take(max_bytes.saturating_add(1)).read_to_end(&mut data).is_ok() && data.len() as u64 <= max_bytes {
+            return Some(data);
+        }
+    }
+    None
 }
 
 pub(crate) fn open_idml(s: &mut Session, p: &Value) -> Result<Value> {
@@ -74,4 +107,41 @@ pub(crate) fn open_idml(s: &mut Session, p: &Value) -> Result<Value> {
     // Never save over the .idml with the native format: the document starts unsaved.
     let i = s.add_document(DocState::new(d, None));
     Ok(json!({"index": i}))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::read_link_beside_idml;
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> std::path::PathBuf {
+        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dc-idml-links-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn linked_resources_stay_beside_the_package() {
+        let root = test_dir();
+        let package = root.join("package");
+        std::fs::create_dir_all(package.join("Links")).unwrap();
+        std::fs::write(package.join("Links/photo.jpg"), b"jpeg").unwrap();
+        std::fs::write(package.join("large.jpg"), b"12345").unwrap();
+        assert_eq!(read_link_beside_idml(&package, "photo.jpg", 4).as_deref(), Some(b"jpeg".as_slice()));
+        assert!(read_link_beside_idml(&package, "../photo.jpg", 4).is_none());
+        assert!(read_link_beside_idml(&package, "large.jpg", 4).is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = root.join("outside.jpg");
+            std::fs::write(&outside, b"data").unwrap();
+            symlink(&outside, package.join("escape.jpg")).unwrap();
+            assert!(read_link_beside_idml(&package, "escape.jpg", 4).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

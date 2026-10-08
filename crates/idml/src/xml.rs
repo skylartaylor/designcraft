@@ -3,6 +3,10 @@
 
 use quick_xml::events::Event;
 
+const MAX_XML_DEPTH: usize = 256;
+const MAX_XML_EVENTS: usize = 1_000_000;
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 4_096;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     El(El),
@@ -200,15 +204,26 @@ pub fn parse(bytes: &[u8]) -> Result<El, String> {
     r.config_mut().trim_text(false);
     let mut stack: Vec<El> = vec![El::new("#document")];
     let mut buf = Vec::new();
+    let mut events = 0usize;
     let pos = |r: &quick_xml::Reader<&[u8]>| r.buffer_position();
     loop {
         let ev = r.read_event_into(&mut buf).map_err(|e| format!("XML error at {}: {e}", pos(&r)))?;
+        events = events.checked_add(1).ok_or("XML event count overflow")?;
+        if events > MAX_XML_EVENTS {
+            return Err(format!("XML event limit exceeded ({MAX_XML_EVENTS})"));
+        }
         match ev {
             Event::Start(e) => {
+                if stack.len() > MAX_XML_DEPTH {
+                    return Err(format!("XML nesting depth limit exceeded ({MAX_XML_DEPTH})"));
+                }
                 let el = start_el(&e)?;
                 stack.push(el);
             }
             Event::Empty(e) => {
+                if stack.len() > MAX_XML_DEPTH {
+                    return Err(format!("XML nesting depth limit exceeded ({MAX_XML_DEPTH})"));
+                }
                 let el = start_el(&e)?;
                 stack.last_mut().ok_or("unbalanced")?.push(el);
             }
@@ -280,7 +295,10 @@ fn push_text(el: &mut El, s: &str) {
 fn start_el(e: &quick_xml::events::BytesStart) -> Result<El, String> {
     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
     let mut el = El::new(&name);
-    for a in e.attributes().with_checks(false) {
+    for (i, a) in e.attributes().with_checks(false).enumerate() {
+        if i >= MAX_ATTRIBUTES_PER_ELEMENT {
+            return Err(format!("XML attribute limit exceeded ({MAX_ATTRIBUTES_PER_ELEMENT})"));
+        }
         let a = a.map_err(|e| e.to_string())?;
         let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
         let v = a.normalized_value(Default::default()).map(|v| v.to_string()).unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
@@ -315,5 +333,12 @@ mod tests {
         assert_eq!(e.num("PointSize"), Some(9.0));
         assert_eq!(e.num("Leading"), Some(14.0));
         assert_eq!(e.prop("Missing"), None);
+    }
+
+    #[test]
+    fn rejects_excessive_nesting() {
+        let mut xml = "<R>".repeat(MAX_XML_DEPTH + 1);
+        xml.push_str(&"</R>".repeat(MAX_XML_DEPTH + 1));
+        assert!(parse(xml.as_bytes()).is_err_and(|e| e.contains("nesting depth limit")));
     }
 }

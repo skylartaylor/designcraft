@@ -259,14 +259,14 @@ fn imports_hand_written_fixture() {
     let oval = &g.children()[0];
     assert_eq!(oval.fill.swatch, "Fade");
     assert_eq!((oval.stroke.swatch.as_str(), oval.stroke.weight), ("Brand", 2.0));
-    // Linked image with a missing file: link recorded, no data; stroke from the object style.
+    // An absolute linked image is not resolved or retained; the stroke still comes from the object style.
     let img = sp.items.iter().find(|i| i.graphic().is_some()).unwrap();
     assert_eq!(img.stroke.swatch, "[Black]");
     let a = &d.assets[&img.graphic().unwrap().asset];
-    assert_eq!(a.link.as_deref(), Some("/definitely/missing dir/photo.jpg"));
+    assert_eq!(a.link, None);
     assert!(a.data.is_empty());
     assert_eq!(a.mime, "image/jpeg");
-    assert_eq!(a.name, "photo.jpg");
+    assert_eq!(a.name, "image");
 }
 
 #[test]
@@ -341,11 +341,60 @@ fn round_trips_small_document() {
 
 #[test]
 fn uri_and_base64_helpers() {
-    assert_eq!(import::uri_to_path("file:/a%20b/c.png"), "/a b/c.png");
-    assert_eq!(import::uri_to_path("file:///C:/x/y.jpg"), "C:/x/y.jpg");
+    assert_eq!(import::uri_to_path("file:Links/a%20b/c.png").as_deref(), Some("Links/a b/c.png"));
+    assert_eq!(import::uri_to_path("images/photo.jpg").as_deref(), Some("images/photo.jpg"));
+    for invalid in ["file:/a.png", "file:///C:/x.jpg", "file:../x.jpg", "file:a/%2e%2e/x.jpg", "https://example.test/x.jpg"] {
+        assert_eq!(import::uri_to_path(invalid), None, "{invalid}");
+    }
     assert_eq!(export::path_to_uri("/a b/c.png"), "file:/a%20b/c.png");
     let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
     assert_eq!(base64_decode(&base64_encode(&data)), data);
+    assert!(base64_decode_bounded("YWJjZGU=", 4).is_none());
+}
+
+#[test]
+fn linked_resource_reader_receives_only_supported_relative_paths() {
+    use std::cell::RefCell;
+
+    let spread = SPREAD.replace("file:/definitely/missing%20dir/photo.jpg", "file:Links/photo%20one.jpg");
+    let bytes = zip_files(&[
+        ("designmap.xml", DESIGNMAP),
+        ("Resources/Graphic.xml", GRAPHIC),
+        ("Resources/Styles.xml", STYLES),
+        ("Resources/Preferences.xml", PREFS),
+        ("MasterSpreads/MasterSpread_m1.xml", MASTER),
+        ("Spreads/Spread_sp1.xml", &spread),
+        ("Stories/Story_s1.xml", STORY),
+    ]);
+    let paths = RefCell::new(Vec::new());
+    let d = import_idml_with(&bytes, &|path| {
+        paths.borrow_mut().push(path.to_string());
+        Some(vec![0xff, 0xd8, 0xff, 0xd9])
+    })
+    .unwrap();
+    assert_eq!(paths.into_inner(), ["Links/photo one.jpg"]);
+    let asset = d.assets.values().next().unwrap();
+    assert_eq!(asset.link.as_deref(), Some("Links/photo one.jpg"));
+    assert_eq!(asset.mime, "image/jpeg");
+    assert_eq!(asset.data.as_slice(), &[0xff, 0xd8, 0xff, 0xd9]);
+}
+
+#[test]
+fn archive_entry_count_is_bounded() {
+    use zip::write::SimpleFileOptions;
+
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for i in 0..=import::MAX_ARCHIVE_ENTRIES {
+        w.start_file(format!("Resources/Part{i}.xml"), SimpleFileOptions::default()).unwrap();
+    }
+    let bytes = w.finish().unwrap().into_inner();
+    assert!(import_idml(&bytes).is_err_and(|e| e.to_string().contains("entries")));
+}
+
+#[test]
+fn archive_entry_paths_are_validated() {
+    let bytes = zip_files(&[("../designmap.xml", "<Document/>")]);
+    assert!(import_idml(&bytes).is_err_and(|e| e.to_string().contains("entry name")));
 }
 
 #[test]

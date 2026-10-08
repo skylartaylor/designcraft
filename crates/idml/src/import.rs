@@ -18,39 +18,63 @@ use designcraft_geom::{Affine, Anchor, PathData, Point, Rect, SubPath};
 
 use crate::names::{self, CHAR_BUILTINS, OBJECT_BUILTINS, PARA_BUILTINS, unescape_id};
 use crate::xml::{El, Node, parse};
-use crate::{IdmlError, MIMETYPE, Result, base64_decode, sniff_image};
+use crate::{IdmlError, MAX_LINKED_RESOURCE_BYTES, MIMETYPE, Result, base64_decode_bounded, sniff_image};
 
-/// Import an IDML package. Linked images are read from disk when available (not on wasm).
+const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 4_096;
+const MAX_ARCHIVE_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_NAME_BYTES: usize = 1_024;
+
+/// Import an IDML package without resolving external linked resources.
+///
+/// Call [`import_idml_with`] when a trusted caller can resolve the normalized relative paths
+/// emitted by the importer against the package's location.
 pub fn import_idml(bytes: &[u8]) -> Result<Document> {
     import_idml_with(bytes, &default_reader)
 }
 
-fn default_reader(path: &str) -> Option<Vec<u8>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::fs::read(path).ok()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = path;
-        None
-    }
+fn default_reader(_path: &str) -> Option<Vec<u8>> {
+    None
 }
 
-/// Import with a custom reader for linked files (`path` → bytes).
+/// Import with a custom reader for linked files (normalized relative `path` → bytes).
+///
+/// Absolute paths, parent components, non-file URIs, and unsupported resource types are never
+/// passed to the reader. Returned resources larger than [`MAX_LINKED_RESOURCE_BYTES`] are ignored.
 pub fn import_idml_with(bytes: &[u8], read_link: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Document> {
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(IdmlError::NotIdml(format!("archive exceeds {MAX_ARCHIVE_BYTES} bytes")));
+    }
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| IdmlError::NotIdml(e.to_string()))?;
+    if zip.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(IdmlError::NotIdml(format!("archive has more than {MAX_ARCHIVE_ENTRIES} entries")));
+    }
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut expanded_bytes = 0u64;
     for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| IdmlError::NotIdml(e.to_string()))?;
+        let f = zip.by_index(i).map_err(|e| IdmlError::NotIdml(e.to_string()))?;
+        let name = f.name().to_string();
+        if !safe_archive_name(&name, f.is_dir()) {
+            return Err(IdmlError::NotIdml(format!("invalid archive entry name `{name}`")));
+        }
+        if f.size() > MAX_ARCHIVE_PART_BYTES {
+            return Err(IdmlError::Part { part: name, msg: format!("part exceeds {MAX_ARCHIVE_PART_BYTES} bytes") });
+        }
+        expanded_bytes = expanded_bytes.checked_add(f.size()).ok_or_else(|| IdmlError::NotIdml("expanded archive size overflow".into()))?;
+        if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+            return Err(IdmlError::NotIdml(format!("expanded archive exceeds {MAX_ARCHIVE_EXPANDED_BYTES} bytes")));
+        }
         if f.is_dir() {
             continue;
         }
-        let name = f.name().to_string();
-        // The size is what the archive claims: don't reserve more than a sane part up front.
-        let mut buf = Vec::with_capacity((f.size() as usize).min(1 << 24));
-        f.read_to_end(&mut buf).map_err(|e| IdmlError::Part { part: name.clone(), msg: e.to_string() })?;
-        files.insert(name, buf);
+        if should_load_archive_entry(&name) {
+            let size = f.size();
+            let buf = read_bounded(f, size, MAX_ARCHIVE_PART_BYTES).map_err(|msg| IdmlError::Part { part: name.clone(), msg })?;
+            if files.insert(name.clone(), buf).is_some() {
+                return Err(IdmlError::NotIdml(format!("duplicate archive entry `{name}`")));
+            }
+        }
     }
     if let Some(m) = files.get("mimetype")
         && String::from_utf8_lossy(m).trim() != MIMETYPE
@@ -67,6 +91,9 @@ pub fn import_idml_with(bytes: &[u8], read_link: &dyn Fn(&str) -> Option<Vec<u8>
     for c in root.elements() {
         if c.name.starts_with("idPkg:") {
             let Some(src) = c.get("src") else { continue };
+            if !expected_xml_part(src) {
+                return Err(IdmlError::Part { part: "designmap.xml".into(), msg: format!("invalid included part `{src}`") });
+            }
             let Some(data) = files.get(src) else { continue };
             let part = parse(data).map_err(|msg| IdmlError::Part { part: src.into(), msg })?;
             top.extend(part.elements().cloned());
@@ -79,6 +106,38 @@ pub fn import_idml_with(bytes: &[u8], read_link: &dyn Fn(&str) -> Option<Vec<u8>
     let d = im.finish(&root)?;
     d.check().map_err(|e| IdmlError::Invalid(e.to_string()))?;
     Ok(d)
+}
+
+fn read_bounded<R: Read>(reader: R, expected: u64, limit: u64) -> std::result::Result<Vec<u8>, String> {
+    if expected > limit {
+        return Err(format!("part exceeds {limit} bytes"));
+    }
+    let capacity = usize::try_from(expected.min(limit)).map_err(|_| "part is too large for this platform")?;
+    let mut buf = Vec::with_capacity(capacity);
+    let mut limited = reader.take(limit.saturating_add(1));
+    limited.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > limit {
+        return Err(format!("part exceeds {limit} bytes"));
+    }
+    Ok(buf)
+}
+
+fn safe_archive_name(name: &str, is_dir: bool) -> bool {
+    if name.is_empty() || name.len() > MAX_ARCHIVE_NAME_BYTES || name.contains(['\\', '\0']) || name.starts_with('/') {
+        return false;
+    }
+    let name = if is_dir { name.trim_end_matches('/') } else { name };
+    !name.is_empty() && name.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(':'))
+}
+
+fn expected_xml_part(name: &str) -> bool {
+    safe_archive_name(name, false)
+        && name.ends_with(".xml")
+        && (name == "designmap.xml" || ["Resources/", "MasterSpreads/", "Spreads/", "Stories/", "XML/"].iter().any(|prefix| name.starts_with(prefix)))
+}
+
+fn should_load_archive_entry(name: &str) -> bool {
+    name == "mimetype" || expected_xml_part(name)
 }
 
 struct ItemCtx {
@@ -2000,22 +2059,25 @@ impl<'r> Importer<'r> {
         };
         let size = ((r - l).abs(), (b - t).abs());
         let link = g.find("Link");
-        let uri = link.and_then(|k| k.get("LinkResourceURI")).map(uri_to_path);
-        let mut data = g.prop_el("Contents").map(|c| base64_decode(&c.text_content())).unwrap_or_default();
+        let uri = link.and_then(|k| k.get("LinkResourceURI")).and_then(uri_to_path);
+        let expected_mime = linked_resource_mime(g, link, uri.as_deref());
+        let mut data =
+            g.prop_el("Contents").and_then(|c| base64_decode_bounded(&c.text_content(), MAX_LINKED_RESOURCE_BYTES as usize)).unwrap_or_default();
         if data.is_empty()
             && let Some(p) = &uri
+            && expected_mime.is_some()
             && let Some(d) = (self.read_link)(p)
+            && d.len() as u64 <= MAX_LINKED_RESOURCE_BYTES
         {
             data = d;
         }
-        let (mime, px) = sniff_image(&data);
-        let mime = mime.map(str::to_string).unwrap_or_else(|| match link.and_then(|k| k.get("LinkResourceFormat")).unwrap_or("") {
-            f if f.contains("JPEG") => "image/jpeg".into(),
-            f if f.contains("TIFF") => "image/tiff".into(),
-            f if f.contains("PDF") || g.local() == "PDF" => "application/pdf".into(),
-            f if f.contains("GIF") => "image/gif".into(),
-            _ => "image/png".into(),
-        });
+        let (mut mime, mut px) = sniff_image(&data);
+        if !data.is_empty() && mime.zip(expected_mime).is_some_and(|(actual, expected)| actual != expected) {
+            data.clear();
+            mime = None;
+            px = None;
+        }
+        let mime = mime.or(expected_mime).unwrap_or("image/png").to_string();
         let pixels = px.or_else(|| {
             let ppi = nums(g.get("ActualPpi").unwrap_or(""));
             (ppi.len() == 2 && size.0 > 0.0).then(|| ((size.0 * ppi[0] / 72.0).round() as u32, (size.1 * ppi[1] / 72.0).round() as u32))
@@ -2294,25 +2356,71 @@ fn path_of(pg: &El) -> PathData {
     PathData::new(subs)
 }
 
-/// IDML link URI → file system path (`file:/a%20b` → `/a b`, `file:///C:/x` → `C:/x`).
-pub(crate) fn uri_to_path(uri: &str) -> String {
-    let rest = uri.strip_prefix("file://").or_else(|| uri.strip_prefix("file:")).unwrap_or(uri);
-    // `file:///C:/…` → `/C:/…` → `C:/…`
-    let rest = if rest.len() > 3 && rest.starts_with('/') && rest.as_bytes()[2] == b':' { &rest[1..] } else { rest };
+fn linked_resource_mime(g: &El, link: Option<&El>, path: Option<&str>) -> Option<&'static str> {
+    let format = link.and_then(|k| k.get("LinkResourceFormat")).unwrap_or("").to_ascii_uppercase();
+    if format.contains("JPEG") {
+        return Some("image/jpeg");
+    }
+    if format.contains("TIFF") {
+        return Some("image/tiff");
+    }
+    if format.contains("PDF") || g.local() == "PDF" {
+        return Some("application/pdf");
+    }
+    if format.contains("GIF") {
+        return Some("image/gif");
+    }
+    if format.contains("PNG") || format.contains("PORTABLE NETWORK GRAPHICS") {
+        return Some("image/png");
+    }
+    if format.contains("WEBP") {
+        return Some("image/webp");
+    }
+    let extension = path?.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase())?;
+    match extension.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "pdf" => Some("application/pdf"),
+        "gif" => Some("image/gif"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Turn an IDML file URI into a normalized relative resource path.
+pub(crate) fn uri_to_path(uri: &str) -> Option<String> {
+    let rest = if let Some(rest) = uri.strip_prefix("file:") {
+        rest
+    } else if uri.contains(':') {
+        return None;
+    } else {
+        uri
+    };
     let mut out = Vec::with_capacity(rest.len());
     let b = rest.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16)
-        {
+        if b[i] == b'%' {
+            let encoded = rest.get(i + 1..i + 3)?;
+            let v = u8::from_str_radix(encoded, 16).ok()?;
             out.push(v);
             i += 3;
-            continue;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
-        out.push(b[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    let decoded = String::from_utf8(out).ok()?.replace('\\', "/");
+    if decoded.is_empty() || decoded.starts_with('/') || decoded.contains('\0') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in decoded.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(':') {
+            return None;
+        }
+        parts.push(part);
+    }
+    Some(parts.join("/"))
 }
