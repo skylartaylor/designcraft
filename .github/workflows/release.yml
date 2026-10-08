@@ -41,7 +41,7 @@ jobs:
       date: ${{ steps.v.outputs.date }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - id: v
         name: Resolve version
         run: |
@@ -69,7 +69,7 @@ jobs:
       DESIGNCRAFT_VERSION: ${{ needs.version.outputs.version }}
       DESIGNCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       # Optional font input (docs: storytold/craft-fonts docs/integration.md); releases always embed it.
       - name: Check out craft-fonts
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -77,10 +77,10 @@ jobs:
           repository: storytold/craft-fonts
           ref: abb83316d96aa59c1cf64784289e378fe9fa5695
           path: craft-fonts
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-macos-universal
       - name: Apply version override
@@ -100,7 +100,7 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: packaging/macos/package.sh --arch universal
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-macos
           path: dist/release/*
@@ -128,7 +128,7 @@ jobs:
       DESIGNCRAFT_VERSION: ${{ needs.version.outputs.version }}
       DESIGNCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       # Optional font input (docs: storytold/craft-fonts docs/integration.md); releases always embed it.
       - name: Check out craft-fonts
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -136,10 +136,10 @@ jobs:
           repository: storytold/craft-fonts
           ref: abb83316d96aa59c1cf64784289e378fe9fa5695
           path: craft-fonts
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-windows-${{ matrix.arch }}
       - name: Apply version override
@@ -163,7 +163,7 @@ jobs:
           AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
         run: ./packaging/windows/package.ps1 -Arch ${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows-${{ matrix.arch }}
           path: dist/release/*
@@ -180,14 +180,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-22.04, deb: amd64 }
-          - { arch: aarch64, runner: ubuntu-22.04-arm, deb: arm64 }
+          - arch: x86_64
+            runner: ubuntu-22.04
+            deb: amd64
+            nfpm_sha256: 3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            deb: arm64
+            nfpm_sha256: 27419eb382695a7942be8ad52259f3ec1854fad001b3ae4baed34ce39a223b97
     env:
       DESIGNCRAFT_VERSION: ${{ needs.version.outputs.version }}
       DESIGNCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
       NFPM_VERSION: 2.47.0
+      NFPM_SHA256: ${{ matrix.nfpm_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       # Optional font input (docs: storytold/craft-fonts docs/integration.md); releases always embed it.
       - name: Check out craft-fonts
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -203,9 +210,10 @@ jobs:
             desktop-file-utils appstream python3-yaml
           curl -fsSL -o "$RUNNER_TEMP/nfpm.deb" \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${{ matrix.deb }}.deb"
+          printf '%s  %s\n' "$NFPM_SHA256" "$RUNNER_TEMP/nfpm.deb" | sha256sum -c -
           sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-linux-${{ matrix.arch }}
       - name: Apply version override
@@ -226,7 +234,7 @@ jobs:
             chmod +x "$appimage"
             APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/release/*
@@ -241,8 +249,9 @@ jobs:
       DESIGNCRAFT_VERSION: ${{ needs.version.outputs.version }}
       DESIGNCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
       TRUNK_VERSION: 0.21.14
+      TRUNK_SHA256: f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       # Optional font input (docs: storytold/craft-fonts docs/integration.md); releases always embed it.
       - name: Check out craft-fonts
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -250,16 +259,19 @@ jobs:
           repository: storytold/craft-fonts
           ref: abb83316d96aa59c1cf64784289e378fe9fa5695
           path: craft-fonts
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-web
       - name: Install trunk
         run: |
-          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C "$HOME/.cargo/bin" trunk
+          archive="$RUNNER_TEMP/trunk.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$TRUNK_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$HOME/.cargo/bin" trunk
           trunk --version
       - name: Apply version override
         if: inputs.version != ''
@@ -269,7 +281,7 @@ jobs:
           CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
         run: packaging/web/package.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-web
           path: dist/release/*
@@ -288,7 +300,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: artifacts

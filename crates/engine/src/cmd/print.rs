@@ -1,5 +1,8 @@
 //! File › Print: the pages go to a printer through the system print spooler (`lpr`), as PDF.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
+
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, cmd, has_doc, str_param};
@@ -43,7 +46,12 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let printer = str_param(p, "printer").map(str::to_string);
     let dry = p.get("dryRun").and_then(Value::as_bool).unwrap_or(false);
     let pdf = designcraft_pdf::export_pdf(d, &s.cache, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
-    let file = std::env::temp_dir().join(format!("designcraft-print-{}-{}.pdf", std::process::id(), d.title.replace(['/', '\\'], "_")));
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut file = secure_print_file()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let file_path = file.path().to_path_buf();
+    #[cfg(target_arch = "wasm32")]
+    let file_path = std::env::temp_dir().join("designcraft-print.pdf");
     let mut cmd: Vec<String> = vec!["lpr".into()];
     if let Some(pr) = &printer {
         cmd.extend(["-P".into(), pr.clone()]);
@@ -51,7 +59,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     if copies > 1 {
         cmd.extend(["-#".into(), copies.to_string()]);
     }
-    cmd.extend(["-T".into(), d.title.clone(), file.to_string_lossy().to_string()]);
+    cmd.extend(["-T".into(), d.title.clone(), file_path.to_string_lossy().to_string()]);
     let pages = opts.pages.as_ref().map_or(d.page_count(), |v| v.len());
     let out = json!({"printer": printer, "copies": copies, "pages": pages, "command": cmd, "bytes": pdf.len()});
     if dry {
@@ -64,13 +72,31 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::fs::write(&file, &pdf).map_err(|e| EngineError::Other(format!("{}: {e}", file.display())))?;
+        file.as_file_mut().write_all(&pdf).map_err(|e| EngineError::Other(format!("{}: {e}", file.path().display())))?;
+        file.as_file_mut().flush().map_err(|e| EngineError::Other(format!("{}: {e}", file.path().display())))?;
         let st = std::process::Command::new(&cmd[0]).args(&cmd[1..]).output().map_err(|e| bad("file.print", format!("lpr: {e}")))?;
         if !st.status.success() {
             return Err(bad("file.print", String::from_utf8_lossy(&st.stderr).trim().to_string()));
         }
         Ok(out)
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn secure_print_file() -> Result<tempfile::NamedTempFile> {
+    let file = tempfile::Builder::new()
+        .prefix("designcraft-print-")
+        .suffix(".pdf")
+        .tempfile()
+        .map_err(|e| EngineError::Other(format!("temporary print file: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| EngineError::Other(format!("{}: {e}", file.path().display())))?;
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -88,8 +114,34 @@ mod tests {
         let cmd: Vec<&str> = r["command"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(&cmd[..5], ["lpr", "-P", "Office", "-#", "2"]);
         assert!(cmd.last().unwrap().ends_with(".pdf"));
+        assert!(!std::path::Path::new(cmd.last().unwrap()).exists());
         assert!(r["bytes"].as_u64().unwrap() > 500);
         assert!(s.execute("file.print", &json!({"pages": "9", "dryRun": true})).is_err());
         assert!(s.execute("file.printers", &json!({})).unwrap()["printers"].is_array());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn print_uses_distinct_ephemeral_files() {
+        let first = super::secure_print_file().unwrap();
+        let second = super::secure_print_file().unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(first_path, second_path);
+        drop((first, second));
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    #[test]
+    fn print_file_is_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = super::secure_print_file().unwrap();
+        let path = file.path().to_path_buf();
+        assert_eq!(file.as_file().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+        assert!(!path.exists());
     }
 }

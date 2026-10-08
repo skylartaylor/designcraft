@@ -6,6 +6,8 @@
 //! A recovery entry is `<uid>.designcraft` (the document) plus `<uid>.json` (`{"path", "title",
 //! "saved"}`: the original file, the title, and when it was written).
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -38,7 +40,7 @@ pub fn discard(dir: &Path, uid: u64) {
 /// Write recovery entries for the dirty documents (and drop those of clean ones). Returns how
 /// many were written.
 pub fn save(s: &Session, dir: &Path) -> Result<usize> {
-    std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    secure_recovery_dir(dir)?;
     let mut n = 0;
     for d in &s.docs {
         if !d.is_dirty() {
@@ -48,13 +50,54 @@ pub fn save(s: &Session, dir: &Path) -> Result<usize> {
         let (doc, meta) = files(dir, d.uid);
         let bytes = crate::cmd::to_bytes(&d.doc);
         // Write then rename, so a crash mid-write never leaves a torn file.
-        let tmp = doc.with_extension("tmp");
-        std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &doc)).map_err(|e| EngineError::Other(format!("{}: {e}", doc.display())))?;
+        write_recovery_file(&doc, &bytes)?;
         let m = json!({"path": d.path, "title": d.title(), "saved": designcraft_doc::vars::now()});
-        std::fs::write(&meta, m.to_string()).map_err(|e| EngineError::Other(format!("{}: {e}", meta.display())))?;
+        write_recovery_file(&meta, m.to_string().as_bytes())?;
         n += 1;
     }
     Ok(n)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn secure_recovery_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn secure_recovery_dir(_dir: &Path) -> Result<()> {
+    Err(EngineError::Other("recovery files are unavailable on the web".into()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_recovery_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let Some(dir) = path.parent() else {
+        return Err(EngineError::Other(format!("{} has no parent folder", path.display())));
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".designcraft-recovery-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    }
+    tmp.as_file_mut().write_all(bytes).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    tmp.as_file_mut().sync_all().map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    tmp.persist(path).map_err(|e| EngineError::Other(format!("{}: {}", path.display(), e.error)))?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn write_recovery_file(_path: &Path, _bytes: &[u8]) -> Result<()> {
+    Err(EngineError::Other("recovery files are unavailable on the web".into()))
 }
 
 /// Recovery entries in `dir`: (uid, metadata).
@@ -131,6 +174,27 @@ mod tests {
         s.execute("file.saveAs", &json!({"path": path.to_string_lossy()})).unwrap();
         assert!(list(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_data_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("recovery");
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [10, 10, 100, 100]})).unwrap();
+        assert_eq!(save(&s, &dir).unwrap(), 1);
+
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let entry = entry.unwrap();
+            assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 }
 
