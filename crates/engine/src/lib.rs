@@ -556,4 +556,6 @@ mod tests;
 #[cfg(test)]
 mod tests_idml;
 #[cfg(test)]
+mod tests_previous_layout_reuse;
+#[cfg(test)]
 mod tests_table;
