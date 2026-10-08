@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use super::{CommandSpec, bad, cmd, has_doc, str_param};
 use crate::{EngineError, Result, Session};
 
+const MAX_OUTPUT_COMPONENT_BYTES: usize = 200;
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
@@ -32,10 +34,47 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+fn is_reserved_windows_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches([' ', '.']).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.strip_prefix("COM").is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        || stem.strip_prefix("LPT").is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+}
+
+/// A portable single path component made from document metadata.
+fn safe_component(name: &str, fallback: &str) -> String {
+    let leaf = name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("");
+    let mut safe = String::new();
+    for ch in leaf.trim().chars() {
+        let replacement = ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\');
+        let ch = if replacement { '_' } else { ch };
+        if safe.len() + ch.len_utf8() > MAX_OUTPUT_COMPONENT_BYTES {
+            break;
+        }
+        safe.push(ch);
+    }
+    safe.truncate(safe.trim_end_matches([' ', '.']).len());
+    if safe.is_empty() || safe == "." || safe == ".." {
+        safe = fallback.to_string();
+    }
+    if is_reserved_windows_name(&safe) {
+        safe.insert(0, '_');
+    }
+    safe
+}
+
+fn package_output_path(dir: &Path, title: &str, extension: &str) -> Result<PathBuf> {
+    let path = dir.join(format!("{title}.{extension}"));
+    if path.parent() != Some(dir) {
+        return Err(bad("file.package", "an output filename would be outside the selected directory"));
+    }
+    Ok(path)
+}
+
 /// A file name for asset `a` in a Links folder, unique among `taken`.
 fn link_name(name: &str, id: AssetId, taken: &mut Vec<String>) -> String {
-    let base =
-        Path::new(name).file_name().map(|n| n.to_string_lossy().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("asset-{}", id.0));
+    let fallback = format!("asset-{}", id.0);
+    let base = safe_component(name, &fallback);
     let (stem, ext) = match base.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (base.clone(), String::new()),
@@ -77,28 +116,29 @@ fn write_links(d: &Document, dir: &Path, only: Option<&[AssetId]>) -> Result<(Do
 fn package(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = PathBuf::from(str_param(p, "dir").ok_or_else(|| bad("file.package", "missing `dir`"))?);
     let st = s.doc()?;
-    let title = st.doc.title.clone();
+    let display_title = st.doc.title.clone();
+    let title = safe_component(&display_title, "Untitled");
     let fonts = s.execute("font.list", &json!({}))?;
     let links = s.execute("links.list", &json!({}))?;
     let pre = s.execute("preflight.run", &json!({})).unwrap_or(Value::Null);
     let d = s.doc()?.doc.clone();
     let (packed, mut files) = write_links(&d, &dir.join("Links"), None)?;
-    let doc_path = dir.join(format!("{title}.designcraft"));
+    let doc_path = package_output_path(&dir, &title, "designcraft")?;
     std::fs::write(&doc_path, super::to_bytes(&packed)).map_err(|e| EngineError::Other(format!("{}: {e}", doc_path.display())))?;
     files.insert(0, doc_path);
     if p.get("idml").and_then(Value::as_bool).unwrap_or(true) {
-        let path = dir.join(format!("{title}.idml"));
+        let path = package_output_path(&dir, &title, "idml")?;
         std::fs::write(&path, designcraft_idml::export_idml(&packed)).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
         files.push(path);
     }
     if p.get("pdf").and_then(Value::as_bool).unwrap_or(false) {
-        let path = dir.join(format!("{title}.pdf"));
+        let path = package_output_path(&dir, &title, "pdf")?;
         let bytes = designcraft_pdf::export_pdf(&packed, &s.cache, &Default::default()).map_err(|e| EngineError::Other(e.to_string()))?;
         std::fs::write(&path, bytes).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
         files.push(path);
     }
     // The report: fonts (missing first), links, preflight, the user's instructions.
-    let mut r = format!("Package report: {title}\n\n");
+    let mut r = format!("Package report: {display_title}\n\n");
     if let Some(t) = str_param(p, "instructions").filter(|t| !t.trim().is_empty()) {
         r += &format!("Instructions\n{t}\n\n");
     }
@@ -169,6 +209,23 @@ mod tests {
         let r = s.execute("links.copyTo", &json!({"dir": dir.join("Copies").to_string_lossy()})).unwrap();
         assert_eq!(r["copied"], 1);
         assert!(s.doc().unwrap().doc.assets.values().next().unwrap().link.as_deref().unwrap().contains("Copies"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_uses_portable_names_inside_the_selected_directory() {
+        assert_eq!(safe_component("Archive/Annual: Review", "Untitled"), "Annual_ Review");
+        assert_eq!(safe_component(".", "Untitled"), "Untitled");
+        assert_eq!(safe_component("CON", "Untitled"), "_CON");
+
+        let dir = std::env::temp_dir().join(format!("dc-package-safe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"title": "Archive/Annual: Review"})).unwrap();
+        let r = s.execute("file.package", &json!({"dir": dir.to_string_lossy(), "idml": false})).unwrap();
+        let files = r["files"].as_array().unwrap();
+        assert!(files.iter().all(|path| Path::new(path.as_str().unwrap()).starts_with(&dir)));
+        assert!(dir.join("Annual_ Review.designcraft").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

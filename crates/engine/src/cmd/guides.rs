@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 use super::{CommandSpec, bad, cmd, has_doc, spread_param, str_param};
 use crate::{Result, Session};
 
+const MAX_GUIDE_DIVISIONS: u64 = 1000;
+const MAX_GUIDES_CREATED: usize = 10_000;
+const MAX_GUIDE_GUTTER: f64 = 1_000_000.0;
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
@@ -51,7 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Guides…",
             ["Layout"],
             None,
-            "{rows?: 0, columns?: 0, rowGutter?: 12, columnGutter?: 12, fitTo?: margins|page, removeExisting?: false, spread?, page? (index in the spread; default all pages)}",
+            "{rows?: 0..1000, columns?: 0..1000, rowGutter?: 12, columnGutter?: 12, fitTo?: margins|page, removeExisting?: false, spread?, page? (index in the spread; default all pages)} — at most 10000 guides per command",
             has_doc,
             create_guides
         ),
@@ -132,36 +136,94 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn guide_divisions(p: &Value, key: &str) -> Result<u64> {
+    let Some(value) = p.get(key) else { return Ok(0) };
+    let count = value.as_u64().ok_or_else(|| bad("layout.createGuides", format!("`{key}` must be an integer")))?;
+    if count > MAX_GUIDE_DIVISIONS {
+        return Err(bad("layout.createGuides", format!("`{key}` must not exceed {MAX_GUIDE_DIVISIONS}")));
+    }
+    Ok(count)
+}
+
+fn guide_gutter(p: &Value, key: &str) -> Result<f64> {
+    let Some(value) = p.get(key) else { return Ok(12.0) };
+    let gutter = value.as_f64().ok_or_else(|| bad("layout.createGuides", format!("`{key}` must be a finite number")))?;
+    if !gutter.is_finite() || !(0.0..=MAX_GUIDE_GUTTER).contains(&gutter) {
+        return Err(bad("layout.createGuides", format!("`{key}` must be between 0 and {MAX_GUIDE_GUTTER}")));
+    }
+    Ok(gutter)
+}
+
+fn guide_count(divisions: u64, gutter: f64) -> Result<usize> {
+    let edges = divisions.saturating_sub(1);
+    let count = if gutter > 0.0 { edges.checked_mul(2) } else { Some(edges) }
+        .ok_or_else(|| bad("layout.createGuides", "the requested guide count is too large"))?;
+    usize::try_from(count).map_err(|_| bad("layout.createGuides", "the requested guide count is too large for this platform"))
+}
+
 /// Evenly spaced rows/columns with gutters inside `area`: the guide positions.
-pub(crate) fn grid_positions(a: f64, b: f64, n: u32, gutter: f64) -> Vec<f64> {
+fn grid_positions(a: f64, b: f64, n: u64, gutter: f64) -> Result<Vec<f64>> {
     if n < 2 {
-        return vec![];
+        return Ok(vec![]);
+    }
+    if !a.is_finite() || !b.is_finite() || !gutter.is_finite() || n > MAX_GUIDE_DIVISIONS {
+        return Err(bad("layout.createGuides", "guide geometry must be finite and within the supported range"));
     }
     let cell = ((b - a) - gutter * (n - 1) as f64) / n as f64;
-    let mut v = Vec::new();
+    if !cell.is_finite() {
+        return Err(bad("layout.createGuides", "guide geometry is outside the supported range"));
+    }
+    let mut v = Vec::with_capacity(guide_count(n, gutter)?);
     for k in 1..n {
         let edge = a + k as f64 * cell + (k - 1) as f64 * gutter;
+        if !edge.is_finite() || (gutter > 0.0 && !(edge + gutter).is_finite()) {
+            return Err(bad("layout.createGuides", "guide geometry is outside the supported range"));
+        }
         v.push(edge);
         if gutter > 0.0 {
             v.push(edge + gutter);
         }
     }
-    v
+    Ok(v)
 }
 
 fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
-    let rows = p.get("rows").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let cols = p.get("columns").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let rg = p.get("rowGutter").and_then(Value::as_f64).unwrap_or(12.0);
-    let cg = p.get("columnGutter").and_then(Value::as_f64).unwrap_or(12.0);
+    let rows = guide_divisions(p, "rows")?;
+    let cols = guide_divisions(p, "columns")?;
+    let rg = guide_gutter(p, "rowGutter")?;
+    let cg = guide_gutter(p, "columnGutter")?;
     let to_page = str_param(p, "fitTo") == Some("page");
     let remove = p.get("removeExisting").and_then(Value::as_bool).unwrap_or(false);
     let r = spread_param(p, "spread");
-    let only = p.get("page").and_then(Value::as_u64).map(|v| v as usize);
+    let only = p
+        .get("page")
+        .map(|v| v.as_u64().ok_or_else(|| bad("layout.createGuides", "`page` must be a non-negative integer")))
+        .transpose()?
+        .map(|v| usize::try_from(v).map_err(|_| bad("layout.createGuides", "`page` is too large for this platform")))
+        .transpose()?;
+    let page_count = {
+        let sp = s.doc()?.doc.spread(r).ok_or_else(|| bad("layout.createGuides", "no such spread"))?;
+        match only {
+            Some(page) => {
+                if sp.pages.get(page).is_none() {
+                    return Err(bad("layout.createGuides", "no such page"));
+                }
+                1
+            }
+            None => sp.pages.len(),
+        }
+    };
+    let per_page = guide_count(rows, rg)?
+        .checked_add(guide_count(cols, cg)?)
+        .ok_or_else(|| bad("layout.createGuides", "the requested guide count is too large"))?;
+    let total = per_page
+        .checked_mul(page_count)
+        .filter(|count| *count <= MAX_GUIDES_CREATED)
+        .ok_or_else(|| bad("layout.createGuides", format!("a single command may create at most {MAX_GUIDES_CREATED} guides")))?;
     let layer = s.doc()?.active_layer;
     s.edit(|d, _| {
         let sp = d.spread_mut(r).ok_or_else(|| bad("layout.createGuides", "no such spread"))?;
-        let mut n = 0;
+        let mut n = 0usize;
         for (pi, pg) in sp.pages.iter_mut().enumerate() {
             if only.is_some_and(|o| o != pi) {
                 continue;
@@ -170,7 +232,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
                 pg.guides.clear();
             }
             let area: Rect = if to_page { pg.bounds() } else { pg.margin_rect() };
-            for y in grid_positions(area.y0, area.y1, rows, rg) {
+            for y in grid_positions(area.y0, area.y1, rows, rg)? {
                 pg.guides.push(Guide {
                     orientation: Orientation::Horizontal,
                     position: y,
@@ -181,7 +243,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
                 });
                 n += 1;
             }
-            for x in grid_positions(area.x0, area.x1, cols, cg) {
+            for x in grid_positions(area.x0, area.x1, cols, cg)? {
                 pg.guides.push(Guide {
                     orientation: Orientation::Vertical,
                     position: x,
@@ -193,6 +255,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
                 n += 1;
             }
         }
+        debug_assert_eq!(n, total);
         Ok(json!({"guides": n}))
     })
 }
@@ -229,6 +292,17 @@ mod tests {
         assert!(s.doc().unwrap().doc.spreads[0].pages[0].guides.is_empty());
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(s.doc().unwrap().doc.spreads[0].pages[0].guides.len(), 5);
+    }
+
+    #[test]
+    fn create_guides_validates_generation_limits() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        assert!(s.execute("layout.createGuides", &json!({"columns": MAX_GUIDE_DIVISIONS + 1})).is_err());
+        assert!(s.execute("layout.createGuides", &json!({"columns": 2, "columnGutter": -1})).is_err());
+        assert!(s.execute("layout.createGuides", &json!({"columns": "many"})).is_err());
+        let r = s.execute("layout.createGuides", &json!({"columns": MAX_GUIDE_DIVISIONS, "columnGutter": 0})).unwrap();
+        assert_eq!(r["guides"], MAX_GUIDE_DIVISIONS - 1);
     }
 }
 
