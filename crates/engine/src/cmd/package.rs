@@ -28,10 +28,15 @@ fn is_redirect(metadata: &Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn ensure_real_directory(path: &Path) -> Result<()> {
+fn ensure_real_directory(path: &Path, ancestor: bool) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if is_redirect(&metadata) {
+                // An existing folder above the package may be reached through a link the user
+                // set up (`/tmp` on macOS is one); the package folder itself may not.
+                if ancestor && std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+                    return Ok(());
+                }
                 return Err(path_error(path, "refusing a redirected output directory"));
             }
             if !metadata.is_dir() {
@@ -42,7 +47,7 @@ fn ensure_real_directory(path: &Path) -> Result<()> {
             if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty())
                 && parent != path
             {
-                ensure_real_directory(parent)?;
+                ensure_real_directory(parent, true)?;
             }
             if let Err(e) = std::fs::create_dir(path)
                 && e.kind() != std::io::ErrorKind::AlreadyExists
@@ -69,7 +74,7 @@ struct OutputRoot {
 
 impl OutputRoot {
     fn new(path: PathBuf) -> Result<Self> {
-        ensure_real_directory(&path)?;
+        ensure_real_directory(&path, false)?;
         let canonical = std::fs::canonicalize(&path).map_err(|e| path_error(&path, e))?;
         Ok(Self { path, canonical })
     }
@@ -78,7 +83,7 @@ impl OutputRoot {
         if !path.starts_with(&self.path) {
             return Err(path_error(path, "output path is outside the selected directory"));
         }
-        ensure_real_directory(path)?;
+        ensure_real_directory(path, false)?;
         let canonical = std::fs::canonicalize(path).map_err(|e| path_error(path, e))?;
         if !canonical.starts_with(&self.canonical) {
             return Err(path_error(path, "output directory resolves outside the selected directory"));
@@ -443,6 +448,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relocated_packages_rebind_embedded_image_links_on_open() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dc-package-relocation-{}-{nonce}", std::process::id()));
+        let original = dir.join("original");
+        let moved = dir.join("moved");
+        let png = designcraft_render::Rendered { width: 4, height: 3, pixels: [30, 90, 180, 255].repeat(12) }.to_png();
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"title": "OwnedPackage", "width": 72, "height": 72})).unwrap();
+        s.execute("file.place", &json!({"base64": super::super::base64_encode(&png), "name": "owned.png", "x": 5, "y": 5, "width": 16})).unwrap();
+        s.execute("file.package", &json!({"dir": original.to_string_lossy(), "idml": true, "pdf": false})).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        let expected = std::path::absolute(moved.join("Links").join("owned.png")).unwrap();
+        for (command, extension) in [("file.open", "designcraft"), ("file.openIdml", "idml")] {
+            let mut opened = Session::new();
+            opened.execute(command, &json!({"path": moved.join(format!("OwnedPackage.{extension}")).to_string_lossy()})).unwrap();
+            let asset = opened.doc().unwrap().doc.assets.values().next().unwrap();
+            assert_eq!(*asset.data, png, "{extension}: preserve embedded pixels");
+            assert_eq!(asset.link.as_deref(), expected.to_str(), "{extension}: use the relocated Links file");
+            let links = opened.execute("links.list", &json!({})).unwrap();
+            assert_eq!(links[0]["status"], "ok", "{extension}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn package_writes_document_links_and_report() {
         let dir = std::env::temp_dir().join(format!("dc-package-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -669,12 +699,13 @@ mod tests {
         assert!(!outside.join("Annual.designcraft").exists());
         std::fs::remove_file(&redirected_root).unwrap();
 
-        let redirected_parent = base.join("redirected-parent");
-        symlink(&outside, &redirected_parent).unwrap();
-        let nested_package = redirected_parent.join("nested").join("Package");
-        assert!(s.execute("file.package", &json!({"dir": nested_package.to_string_lossy(), "idml": false})).is_err());
-        assert!(!outside.join("nested").exists());
-        std::fs::remove_file(&redirected_parent).unwrap();
+        // A linked folder above the package is followed, as `/tmp` is on macOS.
+        let linked_parent = base.join("linked-parent");
+        symlink(&outside, &linked_parent).unwrap();
+        let nested_package = linked_parent.join("nested").join("Package");
+        s.execute("file.package", &json!({"dir": nested_package.to_string_lossy(), "idml": false})).unwrap();
+        assert!(outside.join("nested").join("Package").join("Annual.designcraft").is_file());
+        std::fs::remove_file(&linked_parent).unwrap();
 
         let package = base.join("Package");
         std::fs::create_dir_all(&package).unwrap();
