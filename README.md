@@ -54,6 +54,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#web">Web</a> ·
   <a href="#architecture">Architecture</a> ·
+  <a href="#downloads">Downloads</a> ·
   <a href="#the-crafting-apps">The Crafting Apps</a> ·
   <a href="#license-and-credits">License and credits</a>
 </p>
@@ -86,7 +87,8 @@ by its own renderer. Try it yourself with `File → New → Sample Document`, or
   Line breaks are identical on screen and in PDF.
 - **Fast.** Multithreaded SIMD rendering (vello_cpu), copy-on-write documents with O(1) undo
   snapshots, and cached composition.
-- **Open.** A documented native format, IDML import and export, PNG export, and PDF on the roadmap.
+- **Open.** A documented native format, IDML import and export, and PNG, PDF (PDF/X-4, PDF/A-2b)
+  and EPUB export.
   No subscription, no licence server, no telemetry.
 - **Agent-native.** Every menu item, tool gesture, panel control and dialog can be driven over a
   JSON control channel and an **MCP server**, so Claude and other agents can lay out and edit
@@ -121,6 +123,23 @@ include it.
 To drive a running app, send JSON lines to `127.0.0.1:7979`. The protocol is described in
 [`docs/control-protocol.md`](docs/control-protocol.md).
 
+### Logs
+
+The desktop app writes its `log` records to standard error and to `logs/designcraft.log` in the
+settings directory, beside `ui.json` and `prefs.json` (Linux `~/.config/designcraft/logs/`, or
+`$XDG_CONFIG_HOME/designcraft/logs/`; macOS `~/Library/Application Support/DesignCraft/logs/`;
+Windows `%APPDATA%\DesignCraft\logs\`). A start launched from a desktop menu or the Dock has no
+terminal, so this file is what to attach to a bug report: the crash guard's panic report and a
+failed crash-recovery save land there. Each launch moves the previous log to `designcraft.1.log`
+(and that one to `designcraft.2.log`), so the log of a run that crashed survives the next start.
+The file stops growing at 16 MiB. `--version` writes no file.
+
+| Variable | Effect |
+|---|---|
+| `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for DesignCraft's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,designcraft_render=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`designcraft*=debug`). |
+
+The logger is `apps/designcraft/src/logging.rs`; the web build logs to the browser console instead.
+
 ### Web
 
 ```sh
@@ -153,6 +172,51 @@ egui frontend is a separate crate, so the UI can be swapped without touching the
 - **Contributor and agent rules** (clean-room, asset policy, quality gates): [`AGENTS.md`](AGENTS.md)
 - **Bundled assets:** every one is listed with its licence in [`ASSETS.md`](ASSETS.md)
 - **App icon and colour:** a calico cat in a polka-dot scarf on DesignCraft green `#7bb51c`; see [`assets/app-icon/`](assets/app-icon/README.md)
+
+## Downloads
+
+**New to DesignCraft?** Download it from the [DesignCraft page on getartcraft.com](https://getartcraft.com/apps/designcraft). That's the easiest way to install it.
+
+**Want a specific build or format?** On GitHub, the [latest release](https://github.com/storytold/designcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/designcraft/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+
+### Windows
+
+| Build | Installer | Portable |
+|---|---|---|
+| x64 (64-bit Intel/AMD) | `designcraft-<ver>-windows-x64.msi` | `designcraft-<ver>-windows-x64-portable.zip` |
+| arm64 (Snapdragon and other ARM PCs) | `designcraft-<ver>-windows-arm64.msi` | `designcraft-<ver>-windows-arm64-portable.zip` |
+| x86 (32-bit) | `designcraft-<ver>-windows-x86.msi` | `designcraft-<ver>-windows-x86-portable.zip` |
+
+Installers and executables are code-signed.
+
+### macOS
+
+| Build | File | Notes |
+|---|---|---|
+| App, universal (Apple silicon + Intel) | `designcraft-<ver>-macos-universal.dmg` | Signed and notarized |
+| Command-line tool, universal | `designcraft-cli-<ver>-macos-universal.zip` | Signed and notarized |
+
+### Linux
+
+| Format | x86_64 | aarch64 (ARM64) | Notes |
+|---|---|---|---|
+| AppImage | `designcraft-<ver>-linux-x86_64.AppImage` | `designcraft-<ver>-linux-aarch64.AppImage` | Runs anywhere; updates itself with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`.zsync` files) |
+| Flatpak | `designcraft-<ver>-linux-x86_64.flatpak` | `designcraft-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
+| Debian/Ubuntu | `designcraft-<ver>-linux-x86_64.deb` | `designcraft-<ver>-linux-aarch64.deb` | |
+| Fedora/RHEL/openSUSE | `designcraft-<ver>-linux-x86_64.rpm` | `designcraft-<ver>-linux-aarch64.rpm` | |
+| Tarball | `designcraft-<ver>-linux-x86_64.tar.gz` | `designcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
+
+### FreeBSD
+
+| Build | File |
+|---|---|
+| x86_64 | `designcraft-<ver>-freebsd-x86_64.tar.gz` |
+
+### Web (WebAssembly)
+
+| Build | File | Notes |
+|---|---|---|
+| Static site | `designcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
 
 ## The Crafting Apps
 

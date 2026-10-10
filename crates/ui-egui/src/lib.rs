@@ -91,6 +91,7 @@ pub struct SavedWorkspace {
     pub name: String,
     pub control_bar: bool,
     pub task_bar: bool,
+    pub task_bar_pin: Option<[f32; 2]>,
     pub tools_double_column: bool,
     pub dock_tab: String,
     pub dock_expanded: bool,
@@ -199,6 +200,12 @@ pub struct UiState {
     pub snap_zone: f64,
     /// Window > Contextual Task Bar.
     pub task_bar: bool,
+    /// Where the Contextual Task Bar is pinned: its top-left, in points from the canvas's top-left
+    /// (`None`: it follows the selection).
+    pub task_bar_pin: Option<[f32; 2]>,
+    /// Where the Contextual Task Bar was last shown, like [`Self::task_bar_pin`].
+    #[serde(skip)]
+    pub task_bar_at: Option<[f32; 2]>,
     /// Help › About DesignCraft is open.
     pub about: bool,
     /// The About window's tab: 0 About, 1 Contributors, 2 Models (`about::ABOUT_TABS`).
@@ -274,6 +281,8 @@ impl Default for UiState {
             smart_spacing: true,
             snap_zone: 4.0,
             task_bar: true,
+            task_bar_pin: None,
+            task_bar_at: None,
             about: false,
             about_tab: 0,
             pending_urls: Vec::new(),
@@ -553,10 +562,10 @@ impl DesignApp {
                             Some(dialogs::Dialog::new("pdfImport", json!({"path": path, "page": "1", "pages": pages, "target": target})));
                         Ok(Value::Null)
                     } else {
-                        self.run(cmd, json!({"path": path}))
+                        self.open_file(cmd, json!({"path": path}))
                     }
                 }
-                Some(path) => self.run(cmd, json!({"path": path})),
+                Some(path) => self.open_file(cmd, json!({"path": path})),
                 None => Ok(Value::Null),
             };
         }
@@ -588,7 +597,7 @@ impl DesignApp {
     pub(crate) fn confirm_pdf_import(&mut self, page: u64, crop: String) -> Result<Value, String> {
         let file = self.pending_pdf.take().ok_or("PDF import cancelled: no pending file")?;
         self.activate_import_target(&file.request)?;
-        self.run(
+        self.open_file(
             "file.place",
             json!({"name": file.name, "base64": designcraft_engine::cmd::base64_encode(&file.bytes), "pdfPage": page, "pdfCrop": crop}),
         )
@@ -627,7 +636,7 @@ impl DesignApp {
 
     fn import_file(&mut self, file: ImportedFile) -> Result<Value, String> {
         let lower = file.name.to_ascii_lowercase();
-        let layout = lower.ends_with(".designcraft") || lower.ends_with(".idml");
+        let layout = opens_as_document(&file.name);
         let place =
             file.request.purpose == "place" || (matches!(file.request.purpose.as_str(), "drop" | "open") && !layout && !lower.ends_with(".ase"));
         if place || lower.ends_with(".ase") || file.request.purpose == "swatches" {
@@ -646,10 +655,10 @@ impl DesignApp {
         if lower.ends_with(".ase") || file.request.purpose == "swatches" {
             self.run("swatch.load", json!({"base64": b64}))
         } else if place {
-            self.run("file.place", json!({"name": file.name, "base64": b64}))
+            self.open_file("file.place", json!({"name": file.name, "base64": b64}))
         } else {
             let title = file.name.rsplit_once('.').map_or(file.name.as_str(), |(stem, _)| stem);
-            self.run("file.openBytes", json!({"name": title, "base64": b64}))
+            self.open_file("file.openBytes", json!({"name": title, "base64": b64}))
         }
     }
 
@@ -716,16 +725,32 @@ impl DesignApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-            {
-                let p = f.path().to_string_lossy().to_string();
-                if p.is_empty() {
-                    continue;
-                }
-                let lp = p.to_ascii_lowercase();
-                let cmd = if lp.ends_with(".designcraft") || lp.ends_with(".idml") { "file.open" } else { "file.place" };
-                let _ = self.run(cmd, json!({"path": p}));
+            let p = f.path().to_string_lossy().to_string();
+            if !p.is_empty() {
+                let _ = self.open_dropped(&p);
             }
         }
+    }
+
+    /// A file dropped on the window: documents open, anything else is placed.
+    pub fn open_dropped(&mut self, path: &str) -> Result<Value, String> {
+        let cmd = if opens_as_document(path) { "file.open" } else { "file.place" };
+        self.open_file(cmd, json!({"path": path}))
+    }
+
+    /// Open (`file.open`, `file.openBytes`) or place (`file.place`) a file the user chose. A file
+    /// that can't be opened or placed gets an alert with the reason, as well as the status line.
+    pub fn open_file(&mut self, cmd: &str, params: Value) -> Result<Value, String> {
+        let file = match params.get("path").and_then(Value::as_str) {
+            Some(path) => std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string()),
+            None => params.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+        };
+        let r = self.run(cmd, params);
+        if let Err(e) = &r {
+            let title = if cmd == "file.place" { "Can't Place the File" } else { "Can't Open the File" };
+            self.ui.dialog = Some(dialogs::Dialog::new("alert", json!({"title": title, "file": file, "message": e})));
+        }
+        r
     }
 
     /// Inject synthetic events (one pointer event per frame).
@@ -936,6 +961,13 @@ impl DesignApp {
     }
 }
 
+/// Files that open as documents (when dropped or picked) rather than being placed: DesignCraft
+/// and IDML.
+pub fn opens_as_document(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".designcraft", ".idml"].iter().any(|ext| n.ends_with(ext))
+}
+
 pub fn now_ms() -> f64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -948,9 +980,65 @@ pub fn now_ms() -> f64 {
     }
 }
 
+/// Is `text` the name of a key ("AltGraph", "Dead", "AudioVolumeUp") instead of typed text?
+/// Browsers report a key press as a string: the character it types, or a name made of ASCII
+/// letters and digits that starts with a capital. One key press never types such a word.
+pub fn is_key_name(text: &str) -> bool {
+    text.len() > 1 && text.starts_with(|c: char| c.is_ascii_uppercase()) && text.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Drop text events that are key names. eframe's web backend sends the name of every key it
+/// doesn't know as text, so AltGr typed "AltGraph" into the story. `text_field_focused`: an
+/// egui text field has the keyboard; its text comes from the browser's input events, which can
+/// hold whole words, and is left alone.
+pub fn drop_key_name_text(raw: &mut egui::RawInput, text_field_focused: bool) {
+    if !text_field_focused {
+        raw.events.retain(|e| !matches!(e, egui::Event::Text(t) if is_key_name(t)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Control panel's two-row groups were centred as if they were one row tall, so the second
+    /// row hung below the panel and was cut off.
+    #[test]
+    fn control_bar_shows_its_second_row() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
+        app.run("file.newSample", json!({})).unwrap();
+        app.ui.control_bar = true;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        let bar = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("control_bar")).unwrap().outer_rect;
+        assert!(bar.height() > 40.0, "{bar:?}");
+        let rows: Vec<egui::Rect> = h.query_all_by_label("Y:").map(|n| n.rect()).filter(|r| bar.contains(r.left_top())).collect();
+        assert_eq!(rows.len(), 1, "the Y: caption of the Control panel");
+        assert!(rows[0].bottom() <= bar.bottom(), "Y: caption {:?} hangs below the Control panel {bar:?}", rows[0]);
+    }
+
+    #[test]
+    fn key_names_sent_as_text_are_dropped() {
+        let text = |t: &str| egui::Event::Text(t.to_string());
+        let events = || {
+            vec![text("AltGraph"), text("é"), text("Dead"), text("A"), text("Unidentified"), text("ß"), text("AudioVolumeUp"), text("ab"), text("Æ")]
+        };
+        let mut raw = egui::RawInput { events: events(), ..Default::default() };
+        drop_key_name_text(&mut raw, false);
+        assert_eq!(raw.events, vec![text("é"), text("A"), text("ß"), text("ab"), text("Æ")]);
+        // A focused text field gets its text from input events, which can be whole words.
+        let mut raw = egui::RawInput { events: events(), ..Default::default() };
+        drop_key_name_text(&mut raw, true);
+        assert_eq!(raw.events, events());
+    }
 
     #[test]
     fn snap_view_uses_the_saved_switches() {
@@ -962,6 +1050,142 @@ mod tests {
         ui.snap_zone = 0.0;
         assert!(!ui.snap_view().snap_to_guides);
         assert_eq!(ui.snap_view().zone_px, 0.0);
+    }
+
+    /// A temporary file named `name` whose bytes aren't a document or a graphic.
+    fn unreadable_file(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("designcraft-ui-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"neither a document nor a graphic").unwrap();
+        path
+    }
+
+    /// The open alert dialog: (title, message).
+    fn alert(app: &DesignApp) -> (String, String) {
+        let d = app.ui.dialog.as_ref().expect("an alert is open");
+        assert_eq!(d.id, "alert");
+        (d.fields["title"].as_str().unwrap().to_string(), d.fields["message"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn dropped_documents_open_and_the_rest_is_placed() {
+        for name in ["a.designcraft", "B.IDML"] {
+            assert!(opens_as_document(name), "{name}");
+        }
+        for name in ["a.png", "b.pdf", "idml.txt", "c.idml.zip"] {
+            assert!(!opens_as_document(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn dropping_an_unreadable_file_alerts() {
+        // A document opens, so it says it can't be opened.
+        let path = unreadable_file("broken.designcraft");
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        let r = app.open_dropped(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        let e = r.unwrap_err();
+        let (title, message) = alert(&app);
+        assert_eq!(title, "Can't Open the File", "a document opens, it isn't placed");
+        assert_eq!(message, e);
+        assert!(app.ui.status.contains(&e), "the status line says it too");
+        assert!(app.session.documents().is_empty());
+        dialogs::confirm(&mut app).unwrap();
+        assert!(app.ui.dialog.is_none(), "OK closes the alert");
+        // Anything else is placed, so it says it can't be placed.
+        app.run("file.new", json!({})).unwrap();
+        let path = unreadable_file("notes.xyz");
+        let r = app.open_dropped(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        let e = r.unwrap_err();
+        assert_eq!(alert(&app), ("Can't Place the File".to_string(), e));
+    }
+
+    #[test]
+    fn file_open_failures_show_an_alert() {
+        let path = unreadable_file("open.designcraft");
+        let picked = path.to_string_lossy().to_string();
+        let services = Services { pick_open: Some(Box::new(move |_| Some(picked.clone()))), ..Default::default() };
+        let mut app = DesignApp::new(Session::new(), services);
+        let e = app.run("app.openDialog", json!({})).unwrap_err();
+        assert_eq!(alert(&app), ("Can't Open the File".to_string(), e));
+        // Placing it says so too.
+        app.ui.dialog = None;
+        app.run("file.new", json!({})).unwrap();
+        let e = app.run("app.placeDialog", json!({})).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(alert(&app), ("Can't Place the File".to_string(), e));
+    }
+
+    #[test]
+    fn other_command_errors_stay_in_the_status_line() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        assert!(app.run("file.open", json!({"path": "/nonexistent/x.designcraft"})).is_err());
+        assert!(app.ui.dialog.is_none(), "a scripted file.open doesn't raise an alert");
+        assert!(!app.ui.status.is_empty());
+        // The control channel's app.open answers with the error; no alert waits for a click.
+        let (req, _rx) = control::ControlRequest::new("app.open", json!({"path": "/nonexistent/x.designcraft"}));
+        let control::Outcome::Done(r) = control::handle(&mut app, &egui::Context::default(), &req) else { panic!("app.open answers") };
+        assert_eq!(r["ok"], json!(false), "{r}");
+        assert!(app.ui.dialog.is_none(), "a control-channel app.open doesn't raise an alert");
+    }
+}
+
+/// The whole window in a headless test harness, at a chosen window size.
+#[cfg(test)]
+pub(crate) mod test_window {
+    use egui_kittest::Harness;
+
+    pub struct Window {
+        pub app: crate::DesignApp,
+        ready: bool,
+    }
+
+    /// The window at `size` with a new document open.
+    pub fn open(mut app: crate::DesignApp, size: egui::Vec2) -> Harness<'static, Window> {
+        if app.session.active().is_none() {
+            app.run("file.new", serde_json::json!({})).unwrap();
+        }
+        let mut h = Harness::builder().with_size(size).with_max_steps(1000).build_ui_state(
+            |ui, w: &mut Window| {
+                // The builder runs a frame before the texture size can be raised: skip it.
+                if !w.ready {
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                w.app.logic(&ctx);
+                w.app.ui(ui);
+            },
+            Window { app, ready: false },
+        );
+        h.input_mut().max_texture_side = Some(8192);
+        h.state_mut().ready = true;
+        h.run_steps(6);
+        h
+    }
+
+    /// The mouse wheel turned over `pos`: positive `delta` moves the content right and down.
+    pub fn wheel(h: &mut Harness<'static, Window>, pos: egui::Pos2, delta: egui::Vec2) {
+        h.hover_at(pos);
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(10);
+    }
+
+    /// The outer rect of a side or top panel, from egui's memory.
+    pub fn panel_rect(h: &Harness<'static, Window>, id: &str) -> egui::Rect {
+        egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new(id)).map(|s| s.outer_rect).unwrap()
+    }
+
+    /// A primary click at `pos`, then a few frames.
+    pub fn click_at(h: &mut Harness<'static, Window>, pos: egui::Pos2) {
+        h.hover_at(pos);
+        h.drag_at(pos);
+        h.drop_at(pos);
+        h.run_steps(4);
     }
 }
 
