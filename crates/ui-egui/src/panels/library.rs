@@ -40,7 +40,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_open.as_mut().and_then(|f| f("library"))
             && let Err(e) = app.run("library.open", json!({"path": path}))
         {
-            app.status(format!("Library: {e}"));
+            app.status_error("Library", e);
         }
     });
     let Ok(items) = app.session.execute("library.list", &json!({})) else {
@@ -51,7 +51,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     if ui.add_enabled(has_sel, egui::Button::new(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Add Selection")))).clicked()
         && let Err(e) = app.run("library.add", json!({}))
     {
-        app.status(format!("Library: {e}"));
+        app.status_error("Library", e);
     }
     ui.separator();
     let items = items.as_array().cloned().unwrap_or_default();
@@ -77,7 +77,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                 if ui.small_button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Place"))).clicked()
                     && let Err(e) = app.run("library.place", json!({"index": i}))
                 {
-                    app.status(format!("Library: {e}"));
+                    app.status_error("Library", e);
                 }
             });
         });
@@ -93,13 +93,13 @@ pub fn book(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_save.as_mut().and_then(|f| f("Book.dcbook"))
             && let Err(e) = app.run("book.new", json!({"path": path}))
         {
-            app.status(format!("Book: {e}"));
+            app.status_error("Book", e);
         }
         if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Open…"))).clicked()
             && let Some(path) = app.services.pick_open.as_mut().and_then(|f| f("book"))
             && let Err(e) = app.run("book.open", json!({"path": path}))
         {
-            app.status(format!("Book: {e}"));
+            app.status_error("Book", e);
         }
     });
     let Ok(info) = app.session.execute("book.list", &json!({})) else {
@@ -145,7 +145,7 @@ pub fn book(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_open.as_mut().and_then(|f| f("open"))
             && let Err(e) = app.run("book.add", json!({"path": path}))
         {
-            app.status(format!("Book: {e}"));
+            app.status_error("Book", e);
         }
         if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Update Numbering"))).clicked() {
             let _ = app.run("book.paginate", json!({}));
@@ -157,7 +157,7 @@ pub fn book(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_save.as_mut().and_then(|f| f("Book.pdf"))
             && let Err(e) = app.run("book.exportPdf", json!({"path": path}))
         {
-            app.status(format!("Book: {e}"));
+            app.status_error("Book", e);
         }
     });
 }
@@ -204,7 +204,7 @@ pub fn scripts(app: &mut DesignApp, ui: &mut egui::Ui) {
                     app.ui.scripts.push((name, text));
                     sel = app.ui.scripts.len() - 1;
                 }
-                Err(e) => app.status(format!("Scripts: {e}")),
+                Err(e) => app.status_error("Scripts", e),
             }
         }
         if ui
@@ -224,7 +224,11 @@ pub fn scripts(app: &mut DesignApp, ui: &mut egui::Ui) {
         && let Some((name, text)) = app.ui.scripts.get(i).cloned()
     {
         match app.run("script.run", json!({"text": text})) {
-            Ok(r) => app.status(format!("{name}: {} step(s) done", r["steps"])),
+            Ok(r) => app.status(
+                crate::i18n::tr(&app.ui.language, "{name}: {count} step(s) done")
+                    .replace("{name}", &name)
+                    .replace("{count}", &r["steps"].to_string()),
+            ),
             Err(e) => app.status(format!("{name}: {e}")),
         }
     }

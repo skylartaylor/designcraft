@@ -509,7 +509,9 @@ fn prepare_save(s: &Session, dir: &Path) -> Result<Access> {
     protect_retained_sources(s, dir)?;
     let created = secure_recovery_dir(dir)?;
     let access = access(dir, created)?;
-    for document in s.docs.iter().filter(|d| d.is_dirty()) {
+    // New Document's preview is never written.
+    let preview = s.new_document_preview();
+    for document in s.docs.iter().filter(|d| d.is_dirty() && preview != Some(d.uid)) {
         access.check_free(dir, document.uid)?;
     }
     Ok(access)
@@ -521,7 +523,8 @@ pub fn save(s: &Session, dir: &Path) -> Result<usize> {
     let access = prepare_save(s, dir)?;
     let mut n = 0;
     for d in &s.docs {
-        if !d.is_dirty() {
+        // New Document's preview is not a document until Create makes it one.
+        if !d.is_dirty() || s.new_document_preview() == Some(d.uid) {
             discard(dir, d.uid);
             continue;
         }
@@ -544,7 +547,12 @@ pub(crate) fn save_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
     }
     let access = prepare_save(s, dir)?;
     let mut n = 0;
+    let preview = s.new_document_preview();
     for index in 0..s.docs.len() {
+        // New Document's preview is never written, so it has no checkpoint to discard either.
+        if s.docs.get(index).is_some_and(|document| preview == Some(document.uid)) {
+            continue;
+        }
         if s.docs.get(index).is_some_and(|document| !document.is_dirty()) {
             discard_document(s, index, Some(dir));
             continue;
@@ -818,7 +826,7 @@ fn open_with_publisher(s: &mut Session, dir: &Path, mut publish: impl FnMut(&Pat
         st.fonts = fonts;
         // Unsaved: the copy on disk (if any) is older than what was recovered.
         st.saved_doc = std::sync::Arc::new((*st.doc).clone());
-        st.revision += 1;
+        st.bump_revision();
         let index = s.add_document(st);
         opened.push(index);
         // New uids are published without replacement, and the original is consumed only after
@@ -878,8 +886,16 @@ mod tests {
         let st = s2.doc().unwrap();
         assert!(st.is_dirty());
         assert_eq!(st.doc.spreads[0].items.len(), 1);
-        assert_eq!(list(&dir).iter().map(|e| e.0).collect::<Vec<_>>(), [st.uid], "the entry follows its reopened document");
-        discard(&dir, st.uid);
+        // The entry moved to the reopened document: a session that ends before its first
+        // recovery save (a restart, another crash) still leaves it to recover.
+        let entries = list(&dir);
+        assert_eq!(entries.iter().map(|e| e.0).collect::<Vec<_>>(), [st.uid]);
+        let mut s3 = Session::new();
+        assert_eq!(open(&mut s3, &dir).unwrap().len(), 1);
+        assert_eq!(s3.doc().unwrap().doc.spreads[0].items.len(), 1);
+        assert!(s3.doc().unwrap().is_dirty());
+        assert_eq!(list(&dir).len(), 1, "recovering twice never duplicates an entry");
+        discard(&dir, s3.doc().unwrap().uid);
         // Saving a document drops its entry.
         s.recovery_dir = Some(dir.clone());
         assert_eq!(save(&s, &dir).unwrap(), 1);

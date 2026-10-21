@@ -207,6 +207,8 @@ impl From<craft_pdf::write::WriteError> for PdfError {
 }
 
 #[cfg(test)]
+mod rtl_tests;
+#[cfg(test)]
 mod tests;
 
 // Run the same public API/output contracts with the unit-only colliding cache hasher as well

@@ -35,6 +35,90 @@ fn script_from_stdin_with_references_saves_and_exports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--export` wrote a PNG of the page under every name it did not know: `out.html`, `out.txt` and
+/// `OUT.PDF` were page images, and so was `out.designcraft` from `script` (#432).
+#[test]
+fn export_writes_the_file_type_its_extension_names() {
+    let frame = r#"{"rect": [72, 72, 400, 200], "content": "text", "text": "Hello"}"#;
+    let types: [(&str, &[u8]); 13] = [
+        // No extension: a PNG, as before.
+        ("a", b"\x89PNG"),
+        ("a.png", b"\x89PNG"),
+        ("a.jpg", b"\xFF\xD8"),
+        ("A.JPEG", b"\xFF\xD8"),
+        ("a.pdf", b"%PDF"),
+        ("A.PDF", b"%PDF"),
+        ("a.designcraft", b"PK"),
+        ("a.idml", b"PK"),
+        ("a.epub", b"PK"),
+        ("a.html", b"<!DOCTYPE html>"),
+        ("a.htm", b"<!DOCTYPE html>"),
+        ("a.rtf", b"{\\rtf"),
+        ("a.txt", b"Hello"),
+    ];
+    for mode in ["run", "script"] {
+        let dir = std::env::temp_dir().join(format!("dc-cli-types-{mode}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("page.dcs");
+        std::fs::write(&script, format!("frame.create {frame}\n")).unwrap();
+        let mut args: Vec<String> = match mode {
+            "run" => vec!["run".into(), "--cmd".into(), format!("frame.create={frame}")],
+            _ => vec!["script".into(), script.to_str().unwrap().into()],
+        };
+        for (name, _) in types {
+            args.extend(["--export".into(), dir.join(name).to_str().unwrap().into()]);
+        }
+        let out = cli().args(&args).output().unwrap();
+        assert!(out.status.success(), "{mode}: {}", String::from_utf8_lossy(&out.stderr));
+        for (name, start) in types {
+            let bytes = std::fs::read(dir.join(name)).unwrap();
+            assert!(bytes.starts_with(start), "{mode} --export {name} wrote {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(16)]));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A file type `--export` does not write is an error, before anything runs or is written.
+#[test]
+fn export_to_an_unknown_file_type_is_an_error() {
+    let dir = std::env::temp_dir().join(format!("dc-cli-unknown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, doc, unknown) = (dir.join("a.png"), dir.join("a.designcraft"), dir.join("a.xyz"));
+    let (png, doc, unknown) = (png.to_str().unwrap(), doc.to_str().unwrap(), unknown.to_str().unwrap());
+    for args in [["run", "--sample", "--export", png, "--export", unknown], ["script", "-", "--save", doc, "--export", unknown]] {
+        let out = cli().args(args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}: {err}");
+        assert!(err.contains(unknown) && err.contains(".html"), "{args:?}: {err}");
+    }
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "nothing is written when a file type is unknown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--connect` the exports happen in the running app. `--export copy.designcraft` saves a
+/// copy there: Save As would make the copy the file the open document saves to from then on.
+#[test]
+fn script_export_of_the_document_in_the_running_app_saves_a_copy() {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    // Stands in for the app: answers every request and keeps what was asked.
+    let app = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reply = stream.try_clone().unwrap();
+        let mut asked = Vec::new();
+        for line in BufReader::new(stream).lines() {
+            let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            asked.push((request["params"]["command"].clone(), request["params"]["params"]["path"].clone()));
+            writeln!(reply, r#"{{"ok": true, "result": {{}}}}"#).unwrap();
+        }
+        asked
+    });
+    let out = cli().args(["script", "-", "--connect", &port, "--export", "copy.designcraft"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(app.join().unwrap(), [(serde_json::json!("file.saveACopy"), serde_json::json!("copy.designcraft"))]);
+}
+
 #[test]
 fn failing_script_exits_nonzero_with_the_step() {
     let mut child = cli().args(["script", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -65,6 +149,22 @@ fn run_cmd_references_and_describe() {
     let out = cli().args(["commands", "footnote."]).output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v.as_array().unwrap().iter().all(|c| c.to_string().contains("footnote")));
+}
+
+/// #776: a key the command doesn't take fails the run (`--cmd`) or the step (`script`) instead of
+/// being ignored.
+#[test]
+fn unknown_params_fail() {
+    let out = cli().args(["run", "--cmd", r#"style.list={"bogus":1}"#]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown parameter `bogus`; the command takes no parameters"));
+    let mut child = cli().args(["script", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"document.inspect\nfile.new {\"widht\": 300}\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["failedIndex"], 1);
+    assert!(v.to_string().contains("did you mean `width`?"), "{v}");
 }
 
 /// `designcraft-cli --help` printed usage to stderr and exited 1; asking for help is not an
@@ -116,6 +216,20 @@ fn closed_stdout_ends_quietly() {
     assert!(out.status.success() && !err.contains("panicked"), "{:?}: {err}", out.status);
 }
 
+/// `--pdf-options` that was JSON but no object (`[1]`) panicked when the PDF's path was added to it.
+/// `null` means no options (see `pdf_options_that_are_not_an_object_are_an_error_not_a_panic`).
+#[test]
+fn run_pdf_options_that_are_no_object_are_an_error() {
+    let pdf = std::env::temp_dir().join(format!("dc-cli-options-{}.pdf", std::process::id()));
+    for options in ["[1]", "\"all\"", "1"] {
+        let out = cli().args(["run", "--sample", "--pdf-options", options, "--export", pdf.to_str().unwrap()]).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{options}: {err}");
+        assert!(err.contains("--pdf-options") && !err.contains("panicked"), "{options}: {err}");
+    }
+    assert!(!pdf.exists());
+}
+
 /// `--scale`, `--page` and `--pdf-options` apply to the exports after them; one with no export
 /// after it was silently ignored.
 #[test]
@@ -135,6 +249,22 @@ fn run_export_options_come_before_their_export() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     assert!(err.contains("wrote") && std::path::Path::new(a).exists() && std::path::Path::new(b).exists(), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--scale 0`, a negative value or `nan` wrote a 1×1 PNG and exited 0; `inf` said "no such page".
+#[test]
+fn run_scale_that_is_not_finite_and_positive_is_an_error() {
+    let dir = std::env::temp_dir().join(format!("dc-cli-scale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("a.png");
+    for scale in ["nan", "0", "-2", "inf", "-inf"] {
+        let out = cli().args(["run", "--sample", "--scale", scale, "--export", png.to_str().unwrap()]).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "--scale {scale}: {err}");
+        assert!(err.contains("bad --scale"), "--scale {scale}: {err}");
+    }
+    assert!(!png.exists(), "nothing is exported when the scale is wrong");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

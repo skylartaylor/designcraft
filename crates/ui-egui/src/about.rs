@@ -132,9 +132,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             ui.allocate_ui_with_layout(vec2(ui.available_width(), h), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_min_height(h);
                 if app.ui.about_tab == 1 {
-                    crate::credits::contributors_ui(ui);
+                    crate::credits::contributors_ui(ui, &app.ui.language);
                 } else {
-                    crate::credits::models_ui(ui);
+                    crate::credits::models_ui(ui, &app.ui.language);
                 }
             });
             ui.separator();
@@ -174,7 +174,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     .color(t.text_dim),
             ));
             ui.add_space(16.0);
-            if discord_button(ui, "Join the ArtCraft Discord", vec2(300.0, 40.0)) {
+            if discord_button(ui, crate::i18n::tr(&app.ui.language, "Join the ArtCraft Discord"), vec2(300.0, 40.0)) {
                 open = Some("discord");
             }
             ui.add_space(4.0);
@@ -192,7 +192,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 for (text, key) in
                     [("DesignCraft page", "appPage"), ("GitHub", "github"), ("getartcraft.com", "website"), ("Report an issue", "issues")]
                 {
-                    if link(ui, text, links::get(key).unwrap_or_default(), t.accent) {
+                    if link(ui, crate::i18n::tr(&app.ui.language, text), links::get(key).unwrap_or_default(), t.accent) {
                         open = Some(key);
                     }
                     ui.add_space(6.0);
@@ -216,8 +216,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
                 for (slug, name, what) in SIBLINGS {
                     let url = format!("{}/apps/{slug}", links::WEBSITE);
-                    let b =
-                        ui.add(egui::Button::new(egui::RichText::new(*name).size(12.0)).corner_radius(10.0)).on_hover_text(format!("{what} — {url}"));
+                    let b = ui
+                        .add(egui::Button::new(egui::RichText::new(*name).size(12.0)).corner_radius(10.0))
+                        .on_hover_text(format!("{} — {url}", crate::i18n::tr(&app.ui.language, what)));
                     if b.clicked() {
                         app.ui.pending_urls.push(url);
                     }

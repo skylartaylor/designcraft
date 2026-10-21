@@ -1,6 +1,6 @@
 //! Tool cursors drawn in code: black glyphs with a white halo, so they read on any page colour.
 //! The Selection tool's filled arrow, Direct Selection's hollow arrow, the pen nib with a badge for
-//! what a click does (add, delete, close, convert), and a curved double arrow for rotating.
+//! what a click does (add, delete, close, convert, continue), and a curved double arrow for rotating.
 //! Cursors without a glyph stay system cursors.
 //!
 //! Linux and Windows show the glyphs as OS cursors ([`Images`]): the system moves them itself, so
@@ -96,6 +96,7 @@ enum Badge {
     Delete,
     Close,
     Convert,
+    Continue,
 }
 
 /// The pen nib, tip at `o` (top left), with a badge below right.
@@ -121,6 +122,7 @@ fn pen(ink: &mut Ink, o: Pos2, badge: Badge) {
             ink.line(b + vec2(0.0, 6.0), b + vec2(3.0, 0.0));
             ink.line(b + vec2(3.0, 0.0), b + vec2(6.0, 6.0));
         }
+        Badge::Continue => ink.line(b + vec2(1.0, 6.0), b + vec2(5.0, 0.0)),
     }
 }
 
@@ -152,6 +154,7 @@ fn glyph(c: Cursor, p: Pos2) -> Option<Vec<Shape>> {
         Cursor::PenDelete => pen(&mut ink, p, Badge::Delete),
         Cursor::PenClose => pen(&mut ink, p, Badge::Close),
         Cursor::PenConvert => pen(&mut ink, p, Badge::Convert),
+        Cursor::PenContinue => pen(&mut ink, p, Badge::Continue),
         Cursor::Rotate => rotate(&mut ink, p),
         _ => return None,
     }
@@ -321,8 +324,17 @@ mod tests {
     use super::*;
 
     /// Every cursor with a glyph.
-    const GLYPHS: [Cursor; 8] =
-        [Cursor::Arrow, Cursor::ArrowHollow, Cursor::Pen, Cursor::PenAdd, Cursor::PenDelete, Cursor::PenClose, Cursor::PenConvert, Cursor::Rotate];
+    const GLYPHS: [Cursor; 9] = [
+        Cursor::Arrow,
+        Cursor::ArrowHollow,
+        Cursor::Pen,
+        Cursor::PenAdd,
+        Cursor::PenDelete,
+        Cursor::PenClose,
+        Cursor::PenConvert,
+        Cursor::PenContinue,
+        Cursor::Rotate,
+    ];
 
     fn alpha(img: &CustomCursorImage, x: usize, y: usize) -> u8 {
         img.rgba.get((y * img.size[0] as usize + x) * 4 + 3).copied().unwrap_or(0)

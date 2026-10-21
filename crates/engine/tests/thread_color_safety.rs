@@ -221,3 +221,82 @@ fn safety_empty_linked_parent_follows_survivor_only_on_explicit_update() {
         }
     }
 }
+
+fn check_indirect_linked_ancestor_rejection(ancestor_first: bool) {
+    let mut s = setup();
+    let (ancestor_frame, ancestor) = frame(&mut s, "");
+    let (middle_frame, middle) = child(&mut s, ancestor);
+    s.execute("story.setText", &json!({"story": middle.0, "text": "MIDDLE"})).unwrap();
+    let (leaf_frame, leaf) = child(&mut s, middle);
+    s.execute("selection.set", &json!({"ids": [middle_frame]})).unwrap();
+    // Retain a real redo entry so rejection cannot silently clear history.
+    s.execute("story.setText", &json!({"story": middle.0, "text": "REDO"})).unwrap();
+    let redo_doc = s.doc().unwrap().doc.clone();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.story(middle).unwrap().text, "MIDDLE");
+    assert_eq!(s.doc().unwrap().doc.story(middle).unwrap().link, Some((ancestor, 0)));
+    assert_eq!(s.doc().unwrap().doc.story(leaf).unwrap().link, Some((middle, 2)));
+    assert_eq!(link(&mut s, middle)["outOfDate"], false);
+    assert_eq!(link(&mut s, leaf)["outOfDate"], false);
+    s.doc().unwrap().doc.check().unwrap();
+    assert!(!s.doc().unwrap().history.redo.is_empty());
+    let before_doc = s.doc().unwrap().doc.clone();
+    let saved_doc = s.doc().unwrap().saved_doc.clone();
+    let before = state(&s);
+    let (from, to) = if ancestor_first { (ancestor_frame, leaf_frame) } else { (leaf_frame, ancestor_frame) };
+
+    let error = s.execute("text.thread", &json!({"from": from, "to": to})).unwrap_err();
+
+    assert!(error.to_string().contains("linked story"));
+    assert_eq!(s.doc().unwrap().doc, before_doc);
+    assert!(Arc::ptr_eq(&s.doc().unwrap().doc, &before_doc));
+    assert!(Arc::ptr_eq(&s.doc().unwrap().saved_doc, &saved_doc));
+    assert_eq!(state(&s), before, "rejection must preserve selection, history, revision, dirty state and journal");
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc, redo_doc);
+}
+
+#[test]
+fn safety_thread_rejects_empty_indirect_ancestor_before_descendant() {
+    check_indirect_linked_ancestor_rejection(true);
+}
+
+#[test]
+fn safety_thread_rejects_empty_indirect_ancestor_after_descendant() {
+    check_indirect_linked_ancestor_rejection(false);
+}
+
+#[test]
+fn safety_thread_allows_unrelated_empty_frame_beside_linked_descendant() {
+    for empty_first in [true, false] {
+        let mut s = setup();
+        let (_, ancestor) = frame(&mut s, "");
+        let (_, middle) = child(&mut s, ancestor);
+        s.execute("story.setText", &json!({"story": middle.0, "text": "MIDDLE"})).unwrap();
+        let (leaf_frame, leaf) = child(&mut s, middle);
+        let (empty_frame, empty_story) = frame(&mut s, "");
+        let before = s.doc().unwrap().doc.clone();
+        let undo_len = s.doc().unwrap().history.undo.len();
+        assert_eq!(before.story(leaf).unwrap().rev, 1);
+        let (from, to) = if empty_first { (empty_frame, leaf_frame) } else { (leaf_frame, empty_frame) };
+        let frames = vec![designcraft_doc::ItemId(from), designcraft_doc::ItemId(to)];
+        let mut expected = (*before).clone();
+        expected.stories.remove(&empty_story);
+        let st = expected.story_mut(leaf).unwrap();
+        st.frames = frames;
+        st.rev = 2;
+        expected.item_mut(designcraft_doc::ItemId(empty_frame)).unwrap().text_frame_mut().unwrap().story = leaf;
+
+        s.execute("text.thread", &json!({"from": from, "to": to})).unwrap();
+
+        assert_eq!(*s.doc().unwrap().doc, expected);
+        assert_eq!(s.doc().unwrap().selection, designcraft_doc::Selection::items(vec![designcraft_doc::ItemId(to)]));
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo_len + 1);
+        assert_eq!(link(&mut s, middle)["outOfDate"], false);
+        assert_eq!(link(&mut s, leaf)["outOfDate"], false);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc, before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, expected);
+    }
+}

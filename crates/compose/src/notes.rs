@@ -163,6 +163,7 @@ impl Notes {
             opts: TextFrameOptions { first_baseline: o.first_baseline, first_baseline_min: o.first_baseline_min, ..Default::default() },
             vertical: false,
             exclusions: vec![],
+            outline: None,
             page_name: f.page_name.clone(),
             section_marker: f.section_marker.clone(),
             page: f.page,
@@ -248,6 +249,7 @@ impl Notes {
                     rect: Rect::new(x0, y, (x0 + o.rule.width).min(col.x1), y + o.rule.weight),
                     color: o.rule.color.clone(),
                     tint: o.rule.tint,
+                    ..Deco::default()
                 });
             }
             // Previous footnote's last baseline and bottom.

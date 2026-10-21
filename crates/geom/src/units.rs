@@ -258,7 +258,10 @@ fn parse_single(tok: &str, default: Unit, percent_base: Option<f64>) -> Option<f
 /// Format a value (points) in `unit` the way InDesign fields show it: up to 3 decimals, trailing
 /// zeros trimmed; picas as `3p6`, ciceros as `2c4`.
 pub fn format_measure(pt: f64, unit: Unit) -> String {
-    format_measure_prec(pt, unit, 3)
+    // As InDesign shows them: inches to four decimals (a 1p gutter is 0.1667 in, A4 is
+    // 8.2677 in wide), the other units to three.
+    let decimals = if matches!(unit, Unit::Inches | Unit::InchesDecimal) { 4 } else { 3 };
+    format_measure_prec(pt, unit, decimals)
 }
 
 pub fn format_measure_prec(pt: f64, unit: Unit, decimals: usize) -> String {
@@ -299,6 +302,17 @@ mod tests {
     }
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    /// Inches show four decimals, as InDesign's fields do; other units three.
+    #[test]
+    fn inches_show_four_decimals() {
+        assert_eq!(format_measure(12.0, Unit::Inches), "0.1667 in");
+        assert_eq!(format_measure(210.0 * PT_PER_MM, Unit::Inches), "8.2677 in");
+        assert_eq!(format_measure(612.0, Unit::Inches), "8.5 in");
+        assert_eq!(format_measure(9.0, Unit::Inches), "0.125 in");
+        assert_eq!(format_measure(10.0, Unit::Millimeters), "3.528 mm");
+        assert_eq!(format_measure(10.0, Unit::Points), "10 pt");
     }
 
     #[test]

@@ -82,8 +82,14 @@ pub fn specs() -> Vec<CommandSpec> {
 fn join_paths(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = super::targets(s, p)?;
     s.edit(|d, sel| {
-        let ids: Vec<ItemId> =
-            ids.iter().copied().filter(|id| d.item(*id).is_some_and(|it| !it.locked && !it.is_group() && it.text_frame().is_none())).collect();
+        let paths: Vec<ItemId> = ids.iter().copied().filter(|id| d.item(*id).is_some_and(|it| !it.is_group() && it.text_frame().is_none())).collect();
+        let ids: Vec<ItemId> = paths.iter().copied().filter(|id| path_editable(d, *id, "path.join").is_ok()).collect();
+        // A request for two paths never falls back to closing the one that is editable.
+        if ids.len() < paths.len().min(2) {
+            for id in &paths {
+                path_editable(d, *id, "path.join")?;
+            }
+        }
         let open = |d: &Document, id: ItemId| d.item(id).and_then(|it| it.path.subpaths.iter().position(|sp| !sp.closed && sp.anchors.len() > 1));
         match ids.as_slice() {
             [id] => {
@@ -162,11 +168,16 @@ fn convert_points(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit(|d, _| {
         let mut converted = 0;
+        let mut refused = None;
         for (id, si, ai) in &points {
-            let Some(it) = d.item_mut(*id) else { continue };
-            if it.locked || it.is_group() {
+            if d.item(*id).is_none_or(|it| it.is_group()) {
                 continue;
             }
+            if let Err(e) = path_editable(d, *id, "path.convertPoints") {
+                refused.get_or_insert(e);
+                continue;
+            }
+            let Some(it) = d.item_mut(*id) else { continue };
             let Some(sp) = it.path.subpaths.get_mut(*si) else { continue };
             let Some(a) = sp.anchors.get(*ai).copied() else { continue };
             let auto = smooth_auto(&sp.anchors, *ai, sp.closed);
@@ -193,6 +204,9 @@ fn convert_points(s: &mut Session, p: &Value) -> Result<Value> {
                 converted += 1;
             }
             as_path(&mut it.shape);
+        }
+        if let (0, Some(e)) = (converted, refused) {
+            return Err(e);
         }
         Ok(json!({"converted": converted}))
     })

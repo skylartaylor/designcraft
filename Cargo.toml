@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/designcraft", "apps/designcraft-cli", "xtask"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.10.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -13,7 +13,6 @@ repository = "https://github.com/storytold/designcraft"
 [workspace.dependencies]
 # Shared writer; the immutable revision must be published before this consumer.
 craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8", version = "=0.1.0", default-features = false }
-craft-print = { git = "https://github.com/storytold/craft-libs", version = "0.1.0", rev = "d991bf6792f8ade99c51358bf3c1d902c8cd96b5" }
 # internal
 designcraft-geom = { path = "crates/geom" }
 designcraft-color = { path = "crates/color" }
@@ -48,6 +47,7 @@ unicode-bidi-mirroring = "0.4"
 unicode-segmentation = "1"
 caseless = "0.2"
 regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+fancy-regex = "0.19.2"
 tempfile = "3"
 same-file = "1.0.6"
 
@@ -69,6 +69,19 @@ qrcodegen = "1.8"
 hayro = "0.7"
 quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+# INDD/INDT → IDML conversion for File › Open: storytold/indd-utils, tracking its main branch
+# (MIT OR Apache-2.0, no dependencies, builds for wasm).
+indd = { git = "https://github.com/storytold/indd-utils", branch = "main" }
+
+# Which paths stored in documents may be followed (craft-libs).
+craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
+# Atomic file replacement for saves and exports (craft-libs).
+craft-atomic = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "e9546e191dd62f2bc1d61eca45dbdc2f1b3c1d8e" }
+# File › Print through the system print spooler (craft-libs).
+craft-print = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "d991bf6792f8ade99c51358bf3c1d902c8cd96b5" }
+
+# ICC colour management: working spaces, transforms, black point compensation (craft-libs).
+craft-cms = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "e9546e191dd62f2bc1d61eca45dbdc2f1b3c1d8e" }
 
 # ui
 # Shared frontend components; keep this dependency above the engine boundary.
@@ -103,8 +116,8 @@ debug = 0
 
 # Opt-in cancelable macOS termination on the pinned winit 0.30 line.
 [patch.crates-io]
-krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8", version = "=0.8.2" }
 winit = { git = "https://github.com/storytold/winit.git", rev = "3d51077fd1a966f84df9ef287839dc84fd5b4ca7" }
+krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8", version = "=0.8.2" }
 # The hayro crates from pdfcraft's vendor/ directory, with the patches its README lists.
 hayro = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }
 hayro-interpret = { git = "https://github.com/storytold/pdfcraft", rev = "b5467d93a0ffaa5e5e6658bccdf8655a3ba689c9" }

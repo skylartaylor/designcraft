@@ -307,6 +307,7 @@ fn properties_stroke_link_opens_the_stroke_panel_in_a_custom_workspace() {
     app.run("file.new", json!({"width":480,"height":360})).unwrap();
     app.run("frame.create", json!({"rect":[80,70,330,230],"content":"none"})).unwrap();
     app.run("window.panel.float", json!({"panel":"layers"})).unwrap();
+    // Floating Layers leaves Pages the active tab beside Properties.
     app.run("window.panel", json!({"panel":"properties"})).unwrap();
     assert!(!app.ui.docking.as_ref().unwrap().contains(&"stroke".into()));
     let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).build_ui_state(
@@ -649,4 +650,140 @@ fn legacy_dock_menu_button_opens_the_active_panel_menu() {
     h.run_steps(3);
     assert_eq!(h.state().session.active().unwrap().doc.page_count(), pages + 1);
     assert!(!egui::Popup::is_any_open(&h.ctx));
+}
+
+/// InDesign's panel tab menu (Learn Skills Daily's InDesign course, 6:20): Close, Close Tab Group,
+/// Minimize and Collapse to Icons. Close Tab Group hides the panels tabbed together.
+#[test]
+fn close_tab_group_hides_the_panels_tabbed_together() {
+    let mut app = app();
+    // The default dock: Properties, Pages and Layers are one tab group.
+    let r = app.run("window.panel.closeGroup", json!({"panel":"pages"})).unwrap();
+    assert_eq!(r["closed"], json!(["properties", "pages", "layers"]));
+    let layout = app.ui.docking.clone().unwrap();
+    assert!(["properties", "pages", "layers"].iter().all(|p| !layout.contains(&p.to_string())));
+    // Window brings one back.
+    app.run("window.panel.activate", json!({"panel":"pages"})).unwrap();
+    assert!(app.ui.docking.as_ref().unwrap().contains(&"pages".to_string()));
+    // A floating group goes as a whole; the dock keeps its own.
+    app.run("window.panel.float", json!({"panel":"swatches","x":40,"y":60})).unwrap();
+    app.run("window.panel.activate", json!({"panel":"color"})).unwrap();
+    app.run("window.panel.move", json!({"panel":"color", "anchor":"swatches"})).unwrap();
+    app.run("window.panel.closeGroup", json!({"panel":"color"})).unwrap();
+    let layout = app.ui.docking.clone().unwrap();
+    assert!(!layout.contains(&"color".to_string()) && !layout.contains(&"swatches".to_string()));
+    assert!(layout.contains(&"pages".to_string()));
+    assert!(app.run("window.panel.closeGroup", json!({"panel":"nope"})).is_err());
+}
+
+#[test]
+fn collapse_to_icons_shrinks_the_dock_to_its_icons() {
+    let mut app = app();
+    assert!(app.ui.dock_expanded);
+    app.run("window.collapseToIcons", json!({})).unwrap();
+    assert!(!app.ui.dock_expanded);
+    // A panel chosen from Window opens the dock again.
+    app.run("window.panel", json!({"panel":"pages"})).unwrap();
+    assert!(app.ui.dock_expanded);
+}
+
+#[test]
+fn a_tabs_context_menu_lists_indesigns_tab_commands_and_close_works() {
+    let mut h = harness(app(), vec2(1280.0, 800.0));
+    let tab = h.query_all_by_label("Layers").find(|node| node.rect().height() <= 45.0).unwrap().rect().center();
+    h.event(Event::PointerMoved(tab));
+    h.run_steps(1);
+    h.event(Event::PointerButton { pos: tab, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    h.event(Event::PointerButton { pos: tab, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    for item in ["Close", "Close Tab Group", "Minimize", "Collapse to Icons", "Float Panel"] {
+        assert!(h.query_by_label(item).is_some(), "{item}");
+    }
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert!(!h.state().ui.docking.as_ref().unwrap().contains(&"layers".to_string()));
+}
+
+/// Window › Styles › Paragraph Styles opens InDesign's floating Character Styles | Paragraph Styles
+/// group, which stays open while other panels open (Learn Skills Daily's InDesign course, 7:55).
+#[test]
+fn paragraph_styles_open_floating_with_character_styles() {
+    let mut app = app();
+    app.run("window.panel", json!({"panel":"paragraphStyles"})).unwrap();
+    let layout = app.ui.docking.clone().unwrap();
+    let group = layout.floating.iter().find(|g| g.panels.iter().any(|p| p == "paragraphStyles")).expect("a floating group");
+    assert_eq!(group.panels, ["characterStyles", "paragraphStyles"]);
+    assert_eq!(group.panels[group.active], "paragraphStyles", "the one chosen is in front");
+    // The dock still shows Properties in front.
+    assert!(matches!(&layout.root, Some(craft_ui::docking::Node::Tabs { panels, active }) if panels[*active] == "properties"), "{:?}", layout.root);
+    // Other panels from Window leave it open.
+    app.run("window.panel", json!({"panel":"color"})).unwrap();
+    app.run("window.panel", json!({"panel":"links"})).unwrap();
+    let layout = app.ui.docking.clone().unwrap();
+    assert!(layout.floating.iter().any(|g| g.panels == ["characterStyles", "paragraphStyles"]));
+    // Once showing, Window › Character Styles brings that tab forward.
+    app.run("window.panel", json!({"panel":"characterStyles"})).unwrap();
+    let layout = app.ui.docking.clone().unwrap();
+    let group = layout.floating.iter().find(|g| g.panels.iter().any(|p| p == "characterStyles")).unwrap();
+    assert_eq!(group.panels[group.active], "characterStyles");
+    assert_eq!(layout.panels().iter().filter(|p| p.as_str() == "characterStyles").count(), 1);
+}
+
+/// Style panels the user docked and then closed come back in the dock, not floating.
+#[test]
+fn paragraph_styles_closed_from_the_dock_reopen_there() {
+    let mut app = app();
+    app.run("window.panel", json!({"panel":"paragraphStyles"})).unwrap();
+    for panel in ["characterStyles", "paragraphStyles"] {
+        app.run("window.panel.move", json!({"panel": panel, "anchor": "properties"})).unwrap();
+    }
+    for panel in ["characterStyles", "paragraphStyles"] {
+        app.run("window.panel.close", json!({"panel": panel})).unwrap();
+    }
+    app.run("window.panel", json!({"panel":"paragraphStyles"})).unwrap();
+    let layout = app.ui.docking.clone().unwrap();
+    assert!(layout.contains(&"paragraphStyles".to_string()));
+    assert!(layout.floating.iter().all(|g| !g.panels.iter().any(|p| p == "paragraphStyles")), "{:?}", layout.floating);
+}
+
+fn click(h: &mut Harness<'static, DesignApp>, at: Pos2, button: PointerButton) {
+    h.event(Event::PointerMoved(at));
+    h.run_steps(1);
+    for pressed in [true, false] {
+        h.event(Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE });
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+/// Window › Paragraph Styles switches to the docking layout. After Window › Pages the Pages panel
+/// keeps its three-line panel menu, and its tab menu lists what the classic dock's does.
+#[test]
+fn pages_keeps_its_panel_menu_in_the_docking_layout() {
+    let mut app = app();
+    app.run("file.new", json!({})).unwrap();
+    app.run("window.panel", json!({"panel":"paragraphStyles"})).unwrap();
+    app.run("window.panel", json!({"panel":"pages"})).unwrap();
+    assert!(app.ui.docking.is_some());
+    let mut h = harness(app, vec2(1280.0, 800.0));
+    let tab = h.query_all_by_label("Pages").find(|node| node.rect().height() <= 45.0).unwrap().rect();
+    let dock = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("shared-panel-dock")).unwrap().outer_rect;
+    click(&mut h, egui::pos2(dock.right() - 12.0, tab.center().y), PointerButton::Primary);
+    assert!(egui::Popup::is_any_open(&h.ctx), "the three-line button must open a menu");
+    for item in ["Numbering & Section Options…", "Close Tab Group", "Float Panel"] {
+        assert!(h.query_by_label(item).is_some(), "{item}");
+    }
+    h.get_by_label("Panel Options…").click();
+    h.run_steps(3);
+    assert!(h.state().ui.dialog.as_ref().is_some_and(|d| d.id == "pagesPanelOptions"));
+    h.state_mut().ui.dialog = None;
+    h.run_steps(2);
+
+    click(&mut h, tab.center(), PointerButton::Secondary);
+    for item in ["Close", "Close Tab Group", "Minimize", "Collapse to Icons", "Float Panel", "Group with"] {
+        assert!(h.query_all_by_label(item).next().is_some(), "{item}");
+    }
+    assert!(h.query_by_label("Close Panel").is_none());
+    assert!(h.query_by_label("Panel Options…").is_none(), "the panel's own commands stay in its panel menu");
 }

@@ -272,3 +272,12 @@ fn character_capture_explicit_null_restores_live_paragraph_inheritance() {
         assert_eq!(effective["chars"]["underlineWeight"], 3.0);
     }
 }
+
+#[test]
+fn character_capture_at_a_bare_caret_takes_the_typing_format() {
+    let (mut s, sid) = story("alpha beta");
+    select(&mut s, sid, 5, 5);
+    s.execute("type.char", &json!({"attrs": {"fontStyle": "Bold"}})).unwrap();
+    s.execute("style.character.create", &json!({"name": "Typed", "fromSelection": true})).unwrap();
+    assert_eq!(chars(&s, "Typed").font_style.as_deref(), Some("Bold"));
+}

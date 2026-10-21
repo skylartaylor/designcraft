@@ -123,6 +123,7 @@ fn drop_shadow_of_text_follows_the_glyphs() {
     d.story_mut(sid).unwrap().format_chars(0..6, |f| f.over.size = Some(40.0));
     let ds = &mut d.item_mut(fid).unwrap().effects.drop_shadow;
     ds.on = true;
+    ds.angle = 135.0;
     ds.distance = 4.0;
     ds.size = 3.0;
     let img = render(&d);
@@ -155,6 +156,7 @@ fn inner_shadow_darkens_inside_the_lit_edge() {
     let id = rect_item(&mut d, Rect::new(30.0, 30.0, 130.0, 130.0), "C=0 M=0 Y=100 K=0");
     let s = &mut d.item_mut(id).unwrap().effects.inner_shadow;
     s.on = true;
+    s.angle = 135.0;
     s.distance = 8.0;
     s.size = 8.0;
     s.opacity = 1.0;
@@ -197,6 +199,67 @@ fn shadow_of_an_object_outside_the_view_still_reaches_it() {
     ds.opacity = 1.0;
     let img = render(&d);
     assert!(lum(img.pixel(8, 80)) < 200, "{:?}", img.pixel(8, 80));
+}
+
+/// Points 70..90 of the page at 8 px a point (400% on a 2x screen), where a wide blur is drawn
+/// offscreen at a lower resolution.
+fn render_zoomed(d: &Document) -> Rendered {
+    let mut r = Renderer::new();
+    let opts = RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
+    let view = Affine::scale(8.0) * Affine::translate(Vec2::new(-70.0, -70.0));
+    r.render(d, &Cache::new(), &[Placed { spread: SpreadRef::Doc(0), xf: Affine::translate(Vec2::ZERO) }], SIZE, SIZE, view, &opts)
+}
+
+#[test]
+fn a_wide_feather_keeps_the_object_sharp_at_high_zoom() {
+    let mut d = doc();
+    // A huge yellow frame holding a small black square (pt 78..82, px 64..96 when zoomed).
+    let id = rect_item(&mut d, Rect::new(-5000.0, -5000.0, 5160.0, 5160.0), "C=0 M=0 Y=100 K=0");
+    let kid = Item {
+        fill: Fill::swatch("[Black]"),
+        ..Item::new(ItemId(d.alloc()), d.default_layer(), Shape::Rectangle, shapes::rectangle(Rect::new(78.0, 78.0, 82.0, 82.0)))
+    };
+    d.item_mut(id).unwrap().content = designcraft_doc::Content::Group { items: vec![std::sync::Arc::new(kid)] };
+    let plain = render_zoomed(&d);
+    // 3σ of a 1,000 pt feather is 6,000 px here, so its mask is drawn at about 1/6 resolution.
+    d.item_mut(id).unwrap().effects.feather = 1000.0;
+    let img = render_zoomed(&d);
+    let worst = plain.pixels.iter().zip(&img.pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(worst <= 4, "the inside of a feathered object matches the object: max channel difference {worst}");
+}
+
+#[test]
+fn a_wide_inner_effect_stays_inside_the_shape_at_high_zoom() {
+    let mut d = doc();
+    // A black backdrop shows a screened glow; white paper shows a shadow.
+    let backdrop = rect_item(&mut d, Rect::new(0.0, 0.0, 160.0, 160.0), "[Black]");
+    // The shape's right edge is at pt 80, px 80 when zoomed.
+    let id = rect_item(&mut d, Rect::new(-2000.0, -2000.0, 80.0, 2160.0), "C=100 M=0 Y=0 K=0");
+    for glow in [false, true] {
+        d.item_mut(backdrop).unwrap().fill = Fill::swatch(if glow { "[Black]" } else { "[None]" });
+        let plain = render_zoomed(&d);
+        let e = &mut d.item_mut(id).unwrap().effects;
+        // 3σ is 24,000 px, so the effect is drawn at about 1/23 resolution.
+        if glow {
+            e.inner_glow.on = true;
+            e.inner_glow.size = 2000.0;
+            e.inner_glow.opacity = 1.0;
+        } else {
+            e.inner_shadow.on = true;
+            e.inner_shadow.color = "[Black]".into();
+            e.inner_shadow.distance = 0.0;
+            e.inner_shadow.size = 2000.0;
+            e.inner_shadow.opacity = 1.0;
+        }
+        let img = render_zoomed(&d);
+        assert_ne!(lum(img.pixel(78, 80)), lum(plain.pixel(78, 80)), "glow {glow}: the effect shows inside the edge");
+        for x in 81..110 {
+            assert_eq!(lum(img.pixel(x, 80)), lum(plain.pixel(x, 80)), "glow {glow}: nothing outside the edge at x {x}");
+        }
+        let e = &mut d.item_mut(id).unwrap().effects;
+        e.inner_glow.on = false;
+        e.inner_shadow.on = false;
+    }
 }
 
 /// Multithreaded contexts draw effects offscreen; the result must match single-threaded.
@@ -269,4 +332,45 @@ fn effects_apply_to_a_frame_with_pasted_in_items() {
     ds.opacity = 1.0;
     let img = render(&d);
     assert!(lum(img.pixel(136, 80)) < 300, "the shadow to the right: {:?}", img.pixel(136, 80));
+}
+
+#[test]
+fn inner_glow_mode_and_technique() {
+    let mut d = doc();
+    let id = rect_item(&mut d, Rect::new(30.0, 30.0, 130.0, 130.0), "[Paper]");
+    let g = &mut d.item_mut(id).unwrap().effects.inner_glow;
+    g.on = true;
+    g.color = "[Black]".into();
+    g.opacity = 1.0;
+    g.size = 20.0;
+    // Screen (the default) can't darken white paper; Multiply can.
+    let screen = render(&d);
+    assert!(lum(screen.pixel(32, 80)) > 740, "{:?}", screen.pixel(32, 80));
+    d.item_mut(id).unwrap().effects.inner_glow.mode = designcraft_color::BlendMode::Multiply;
+    let soft = render(&d);
+    assert!(lum(soft.pixel(32, 80)) + 150 < lum(screen.pixel(32, 80)), "a dark edge: {:?}", soft.pixel(32, 80));
+    // Precise keeps the glow nearer the edge than Softer.
+    d.item_mut(id).unwrap().effects.inner_glow.technique = designcraft_doc::GlowTechnique::Precise;
+    let precise = render(&d);
+    assert!(lum(precise.pixel(42, 80)) > lum(soft.pixel(42, 80)) + 30, "{:?} vs {:?}", precise.pixel(42, 80), soft.pixel(42, 80));
+}
+
+#[test]
+fn feather_choke_and_corners() {
+    let mut d = doc();
+    let id = rect_item(&mut d, Rect::new(30.0, 30.0, 130.0, 130.0), "[Black]");
+    d.item_mut(id).unwrap().effects.feather = 16.0;
+    let diffused = render(&d);
+    golden("feather", &diffused);
+    // Choke: half the width stays opaque, so the fade is shorter.
+    d.item_mut(id).unwrap().effects.feather_options.choke = 50.0;
+    let choked = render(&d);
+    assert!(lum(choked.pixel(38, 80)) + 60 < lum(diffused.pixel(38, 80)), "{:?} vs {:?}", choked.pixel(38, 80), diffused.pixel(38, 80));
+    assert!(lum(choked.pixel(30, 80)) > 500, "still transparent at the path");
+    // Sharp corners keep more of the corner than Rounded ones (past the fade, near the corner).
+    d.item_mut(id).unwrap().effects.feather_options = designcraft_doc::FeatherOptions { choke: 0.0, corners: designcraft_doc::FeatherCorners::Sharp };
+    let sharp = render(&d);
+    d.item_mut(id).unwrap().effects.feather_options.corners = designcraft_doc::FeatherCorners::Rounded;
+    let rounded = render(&d);
+    assert!(lum(sharp.pixel(41, 41)) + 20 < lum(rounded.pixel(41, 41)), "{:?} vs {:?}", sharp.pixel(41, 41), rounded.pixel(41, 41));
 }

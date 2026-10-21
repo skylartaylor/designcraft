@@ -354,7 +354,7 @@ fn place_image(
         report.warnings.push(format!("Record {record}, field {field}: missing image {cell}."));
         return;
     };
-    let Some((pw, ph)) = designcraft_render::image_size(&bytes) else {
+    let Some(((pw, ph), (nw, nh))) = designcraft_render::image_size(&bytes).zip(designcraft_render::natural_size(&bytes, 0)) else {
         if let Some(it) = doc.item_mut(item) {
             it.content = Content::Unassigned;
         }
@@ -367,21 +367,18 @@ fn place_image(
         report.missing.push(MissingImage { record, field: field.to_string(), path: cell.to_string() });
         return;
     };
-    let (nw, nh) = (f64::from(pw), f64::from(ph));
     let mode = fitting_of(&options.fitting);
-    let fresh = AssetId(doc.alloc());
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| field.to_string());
-    let link = options.link_images.then(|| path.to_string_lossy().into_owned());
-    let aid = doc.add_asset(Asset {
-        id: fresh,
-        name,
-        mime: designcraft_render::image_mime(&bytes).to_string(),
-        link,
-        data: Arc::new(bytes),
-        pixels: Some((pw, ph)),
-        page: 0,
-    });
-    let mut g = Graphic { asset: aid, size: (nw, nh), xf: Affine::translate((inner.x0, inner.y0)), auto_fit: mode, fit_align: 0, crop: [0.0; 4] };
+    let mut g = Graphic {
+        asset: AssetId(0),
+        size: (nw, nh),
+        xf: Affine::translate((inner.x0, inner.y0)),
+        auto_fit: mode,
+        fit_align: 0,
+        crop: [0.0; 4],
+        wrap: Default::default(),
+        clip: None,
+        fill: Default::default(),
+    };
     if let Some(xf) = g.fitted(inner, mode) {
         g.xf = xf;
     }
@@ -391,6 +388,27 @@ fn place_image(
         let m = bb.center();
         g.xf = Affine::translate((c.x - m.x, c.y - m.y)) * g.xf;
     }
+    // Reject geometry that cannot be represented before an asset is allocated for it.
+    if super::super::file::validate_placement((nw, nh), inner, g.xf, "data.merge").is_err() {
+        if let Some(it) = doc.item_mut(item) {
+            it.content = Content::Unassigned;
+        }
+        report.missing.push(MissingImage { record, field: field.to_string(), path: cell.to_string() });
+        report.warnings.push(format!("Record {record}, field {field}: image {cell} exceeds finite geometry limits."));
+        return;
+    }
+    let fresh = AssetId(doc.alloc());
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| field.to_string());
+    let link = options.link_images.then(|| path.to_string_lossy().into_owned());
+    g.asset = doc.add_asset(Asset {
+        id: fresh,
+        name,
+        mime: designcraft_render::image_mime(&bytes).to_string(),
+        link,
+        data: Arc::new(bytes),
+        pixels: Some((pw, ph)),
+        ..Default::default()
+    });
     if let Some(it) = doc.item_mut(item) {
         it.content = Content::Graphic(g);
     }
@@ -477,5 +495,23 @@ mod link_tests {
         for bad in ["javascript:alert(1)", "file:///etc/passwd", "data:text/html,hi", "vbscript:x", ""] {
             assert!(classify_link(bad).is_none(), "{bad}");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod image_path_tests {
+    use std::path::Path;
+
+    use super::image_candidates;
+
+    #[test]
+    fn image_cells_resolve_beside_the_data_and_never_to_other_computers() {
+        let (data, doc) = (Path::new("/work/data"), Path::new("/work/doc"));
+        for cell in [r"\\192.0.2.1\share\x.png", "file://192.0.2.1/s/x.png", "//192.0.2.1/s/x.png", "https://example.com/x.png"] {
+            assert!(image_candidates(cell, Some(data), Some(doc)).is_empty(), "{cell}");
+        }
+        let found = image_candidates("img/x.png", Some(data), Some(doc));
+        assert_eq!(found, [data.join("img").join("x.png"), doc.join("img").join("x.png")]);
+        assert!(image_candidates("img/x.png", None, None).is_empty(), "not beside the working directory");
     }
 }

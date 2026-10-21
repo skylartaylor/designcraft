@@ -100,7 +100,7 @@ fn outside_text(text: &str) -> Result<String> {
 fn paste_text_frame(s: &mut Session, p: &Value, text: &str, slice: Option<&designcraft_doc::Story>) -> Result<Value> {
     use designcraft_geom::{Point, Rect, shapes};
     const LIMIT: f64 = 1.0e5;
-    let sr = super::spread_param(p, "spread")?;
+    let sr = super::spread_param(p, "edit.paste")?;
     let at = super::point_param(p, "at")
         .filter(|a| a.x.is_finite() && a.y.is_finite())
         .map(|a| Point::new(a.x.clamp(-LIMIT, LIMIT), a.y.clamp(-LIMIT, LIMIT)));
@@ -172,9 +172,11 @@ pub fn specs() -> Vec<CommandSpec> {
             let st = s.doc_mut()?;
             let e = st.history.undo.pop().ok_or_else(|| super::bad("edit.undo", "nothing to undo"))?;
             st.history.redo.push(HistoryEntry { label: e.label.clone(), doc: st.doc.clone(), selection: st.selection.clone() });
-            st.doc = e.doc;
+            let mut doc = e.doc;
+            super::rulers::keep_zero_point(&st.doc, &mut doc);
+            st.doc = doc;
             st.selection = e.selection;
-            st.revision += 1;
+            st.bump_revision();
             // Pending typing overrides belong to the current edit state, not a restored snapshot.
             s.typing_format = None;
             Ok(json!({"undone": e.label}))
@@ -183,9 +185,11 @@ pub fn specs() -> Vec<CommandSpec> {
             let st = s.doc_mut()?;
             let e = st.history.redo.pop().ok_or_else(|| super::bad("edit.redo", "nothing to redo"))?;
             st.history.undo.push(HistoryEntry { label: e.label.clone(), doc: st.doc.clone(), selection: st.selection.clone() });
-            st.doc = e.doc;
+            let mut doc = e.doc;
+            super::rulers::keep_zero_point(&st.doc, &mut doc);
+            st.doc = doc;
             st.selection = e.selection;
-            st.revision += 1;
+            st.bump_revision();
             s.typing_format = None;
             Ok(json!({"redone": e.label}))
         }),
@@ -206,7 +210,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             st.selection.text = None;
             st.selection.cells = None;
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
         cmd!(noundo "selection.toggle", "Toggle Selection", [], None, "{id}", has_doc, |s, p| {
@@ -219,7 +223,7 @@ pub fn specs() -> Vec<CommandSpec> {
             } else {
                 st.selection.items.push(id);
             }
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
         cmd!(noundo "edit.selectAll", "Select All", ["Edit"], Some("Cmd+A"), "{} — all items on the active spreads, or all text in the story", has_doc, |s, _| {
@@ -243,13 +247,13 @@ pub fn specs() -> Vec<CommandSpec> {
                 }
                 st.selection = Selection::items(ids);
             }
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
         cmd!(noundo "edit.deselectAll", "Deselect All", ["Edit"], Some("Cmd+Shift+A"), "{}", has_doc, |s, _| {
             let st = s.doc_mut()?;
             st.selection = Selection::default();
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
         cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{ids?} — delete selected items (or the selected text)", has_doc, |s, p| {
@@ -278,7 +282,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if let Some(text) = copy_text(s)? {
                 return Ok(json!({"text": text}));
             }
-            s.clipboard = Some(Arc::new(clip_doc(s)?));
+            copy_items(s)?;
             s.text_clipboard = None;
             ok()
         }),
@@ -287,7 +291,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 super::text::delete_selection(s)?;
                 return Ok(json!({"text": text}));
             }
-            s.clipboard = Some(Arc::new(clip_doc(s)?));
+            copy_items(s)?;
             s.execute("edit.clear", p)
         }),
         cmd!(
@@ -304,7 +308,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste",
             ["Edit"],
             Some("Cmd+V"),
-            "{inPlace?: bool, text?: the system clipboard's text (pastes it unless it is what was copied here; with no insertion point it becomes a new text frame), spread?, at?: [x, y] (spread coords: the new text frame's centre)}",
+            "{inPlace?: bool, spread?: index (0), text?: the system clipboard's text (pastes it unless it is what was copied here; with no insertion point it becomes a new text frame), at?: [x, y] (spread coords: the new text frame's centre)}",
             // The system clipboard may hold text from another app, so Paste is always available.
             has_doc,
             |s, p| {
@@ -321,9 +325,13 @@ pub fn specs() -> Vec<CommandSpec> {
                     return Err(super::bad("edit.paste", "clipboard is empty"));
                 };
                 let off = if bool_or(p, "inPlace", false) { 0.0 } else { 12.0 };
+                let to = super::spread_param(p, "edit.paste")?;
+                let from = s.clipboard_origin;
                 let ids: Vec<ItemId> = clip.spreads.first().map(|sp| sp.items.iter().map(|i| i.id).collect()).unwrap_or_default();
                 s.edit(|d, sel| {
-                    let new = super::object::duplicate_from(d, &clip, &ids, SpreadRef::Doc(0), designcraft_geom::Vec2::new(off, off))?;
+                    // The same place on another spread is the same distance from its spine or left edge.
+                    let dx = d.spread(to).map_or(0.0, |sp| paste_origin(sp) - from);
+                    let new = super::object::duplicate_from(d, &clip, &ids, to, designcraft_geom::Vec2::new(dx + off, off))?;
                     *sel = Selection::items(new.clone());
                     Ok(json!({"ids": new.iter().map(|i| i.0).collect::<Vec<_>>()}))
                 })
@@ -338,11 +346,74 @@ pub fn specs() -> Vec<CommandSpec> {
             has_clip,
             paste_into
         ),
-        cmd!("edit.pasteInPlace", "Paste in Place", ["Edit"], Some("Cmd+Alt+Shift+V"), "{}", has_clip, |s, _| s
-            .execute("edit.paste", &json!({"inPlace": true}))),
+        cmd!("edit.pasteInPlace", "Paste in Place", ["Edit"], Some("Cmd+Alt+Shift+V"), "{spread?: index (0)}", has_clip, |s, p| s
+            .execute("edit.paste", &json!({"inPlace": true, "spread": p.get("spread")}))),
         cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+Alt+Shift+D"), "{}", has_selection, |s, _| s
             .execute("transform.move", &json!({"dx": 12.0, "dy": 12.0, "copy": true}))),
+        // Live previews (a panel slider being dragged): the change shows on the page, and only
+        // `edit.commitPreview` makes it one undo step.
+        cmd!(
+            query "edit.preview",
+            "Preview Change",
+            [],
+            None,
+            "{label, command, params?} — run `command` on the document as it was before the preview began, replacing the last preview; the first call opens a preview named `label` (the undo step's name)",
+            has_doc,
+            preview
+        ),
+        cmd!(query "edit.commitPreview", "Commit Preview", [], None, "{} — the open preview becomes one undo step", has_doc, |s, _| {
+            s.commit_interaction()?;
+            ok()
+        }),
+        cmd!(query "edit.cancelPreview", "Cancel Preview", [], None, "{} — the document goes back to how it was before the preview", has_doc, |s, _| {
+            s.cancel_interaction();
+            ok()
+        }),
     ]
+}
+
+/// Put the selected items on the clipboard, with the x Paste measures them from on their spread.
+fn copy_items(s: &mut Session) -> Result<()> {
+    let clip = clip_doc(s)?;
+    let st = s.doc()?;
+    let spread = st.selection.items.iter().find_map(|id| st.doc.find(*id)).and_then(|loc| st.doc.spread(loc.spread));
+    s.clipboard_origin = spread.map_or(0.0, paste_origin);
+    s.clipboard = Some(Arc::new(clip));
+    Ok(())
+}
+
+/// The x a pasted object keeps its distance from: the spine, or the left edge of single-sided
+/// pages, which have none.
+fn paste_origin(sp: &designcraft_doc::Spread) -> f64 {
+    if sp.pages.iter().all(|p| p.side == designcraft_doc::PageSide::Single) { sp.bounds().x0 } else { sp.spine_x() }
+}
+
+/// `edit.preview`: open the preview (unless one of the same name is open) and show `command` on it.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let label = super::str_param(p, "label").filter(|l| !l.is_empty()).ok_or_else(|| super::bad("edit.preview", "missing label"))?;
+    let command = super::str_param(p, "command").ok_or_else(|| super::bad("edit.preview", "missing command"))?;
+    // Only an edit can be previewed: a query, undo or another preview command would not be one undo step.
+    if !super::find_command(command).is_some_and(|c| c.undoable) {
+        return Err(super::bad("edit.preview", format!("{command} is not an edit that can be previewed")));
+    }
+    let params = p.get("params").cloned().unwrap_or_else(|| json!({}));
+    let opened = match s.doc()?.interaction.as_ref().map(|i| i.label.as_str()) {
+        None => {
+            s.begin_interaction(label)?;
+            true
+        }
+        Some(open) if open == label => false,
+        // A tool's drag (or another preview) is in progress: leave it alone.
+        Some(open) => return Err(super::bad("edit.preview", format!("{open} is in progress"))),
+    };
+    if let Err(e) = s.preview(command, params) {
+        // A preview this call opened must not stay open: later edits would get no undo step.
+        if opened {
+            s.cancel_interaction();
+        }
+        return Err(e);
+    }
+    ok()
 }
 
 /// A document holding copies of the selected items (and their stories) on spread 0.
@@ -363,18 +434,13 @@ pub(crate) fn clip_doc(s: &Session) -> Result<designcraft_doc::Document> {
     for sp in d.spreads.iter_mut() {
         Arc::make_mut(sp).items.clear();
     }
-    // Kept frames and graphics (including inside groups).
+    // Kept frames (including inside groups).
     let mut frames = std::collections::HashSet::new();
-    let mut assets = std::collections::HashSet::new();
     for it in &items {
-        it.walk(&mut |i| match &i.content {
-            designcraft_doc::Content::Text(_) => {
+        it.walk(&mut |i| {
+            if let designcraft_doc::Content::Text(_) = &i.content {
                 frames.insert(i.id);
             }
-            designcraft_doc::Content::Graphic(g) => {
-                assets.insert(g.asset);
-            }
-            _ => {}
         });
     }
     if let Some(sp) = d.spreads.first_mut() {
@@ -388,6 +454,8 @@ pub(crate) fn clip_doc(s: &Session) -> Result<designcraft_doc::Document> {
     for st in d.stories.values_mut() {
         Arc::make_mut(st).frames.retain(|f| frames.contains(f));
     }
+    // Graphics on the items and in the kept stories (anchored objects, graphic cells, notes).
+    let assets = d.used_assets();
     d.assets.retain(|k, _| assets.contains(k));
     d.hyperlinks.clear();
     d.bookmarks.clear();
@@ -811,5 +879,187 @@ mod paste_into_tests {
         assert_eq!(s.doc().unwrap().selection, Selection::items(vec![ItemId(frame)]));
         d.check().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+    use designcraft_geom::Rect;
+
+    fn pasted(s: &mut Session, id: &str, p: Value) -> (SpreadRef, Rect) {
+        let new = ItemId(s.execute(id, &p).unwrap()["ids"][0].as_u64().unwrap());
+        let d = &s.doc().unwrap().doc;
+        (d.find(new).unwrap().spread, d.item(new).unwrap().bounds())
+    }
+
+    /// Paste and Paste in Place put the objects on the spread they are given (the first without one).
+    #[test]
+    fn paste_puts_the_objects_on_the_given_spread() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": false})).unwrap();
+        let a = s.execute("frame.create", &json!({"rect": [36, 36, 136, 136]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("selection.set", &json!({"ids": [a]})).unwrap();
+        s.execute("edit.copy", &json!({})).unwrap();
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 2})), (SpreadRef::Doc(2), Rect::new(36.0, 36.0, 136.0, 136.0)));
+        assert_eq!(pasted(&mut s, "edit.paste", json!({"spread": 1})), (SpreadRef::Doc(1), Rect::new(48.0, 48.0, 148.0, 148.0)));
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({})).0, SpreadRef::Doc(0));
+        // A spread the document doesn't have: an error, and nothing is pasted.
+        let before = s.doc().unwrap().doc.clone();
+        assert!(s.execute("edit.paste", &json!({"spread": 9})).is_err());
+        assert_eq!(s.doc().unwrap().doc, before);
+        before.check().unwrap();
+    }
+
+    /// With facing pages the first page sits alone, right of the spine. An object keeps its side
+    /// of the spine when it is pasted in place on another spread.
+    #[test]
+    fn paste_in_place_keeps_the_side_of_the_spine() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 4, "facingPages": true})).unwrap();
+        let w = s.doc().unwrap().doc.settings.page_width;
+        // On page 3, the right-hand page of the second spread.
+        let a = s.execute("frame.create", &json!({"spread": 1, "rect": [w + 36.0, 36, w + 136.0, 136]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("selection.set", &json!({"ids": [a]})).unwrap();
+        s.execute("edit.cut", &json!({})).unwrap();
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 0})), (SpreadRef::Doc(0), Rect::new(36.0, 36.0, 136.0, 136.0)));
+        // And back from page 1.
+        s.execute("edit.cut", &json!({})).unwrap();
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 1})), (SpreadRef::Doc(1), Rect::new(w + 36.0, 36.0, w + 136.0, 136.0)));
+        // Page 4 sits alone left of the spine: the object stays right of it, off the page.
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 2})), (SpreadRef::Doc(2), Rect::new(w + 36.0, 36.0, w + 136.0, 136.0)));
+    }
+
+    /// A single-sided page has no spine: an object keeps its distance from the page's left edge,
+    /// whatever the page widths, and pastes as right-hand content into a facing-pages document.
+    #[test]
+    fn paste_in_place_from_a_single_sided_page_measures_from_its_left_edge() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2, "facingPages": false})).unwrap();
+        s.execute("layout.pageSize", &json!({"pages": [2], "width": 400, "height": 792})).unwrap();
+        let a = s.execute("frame.create", &json!({"spread": 1, "rect": [36, 36, 136, 136]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("selection.set", &json!({"ids": [a]})).unwrap();
+        s.execute("edit.copy", &json!({})).unwrap();
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 0})), (SpreadRef::Doc(0), Rect::new(36.0, 36.0, 136.0, 136.0)));
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true})).unwrap();
+        let w = s.doc().unwrap().doc.settings.page_width;
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({})), (SpreadRef::Doc(0), Rect::new(36.0, 36.0, 136.0, 136.0)));
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 1})), (SpreadRef::Doc(1), Rect::new(w + 36.0, 36.0, w + 136.0, 136.0)));
+    }
+
+    /// A copied text frame's clipping holds the files its anchored graphics show.
+    #[test]
+    fn copied_text_frames_keep_the_graphics_anchored_in_their_text() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let png = designcraft_render::Rendered { width: 4, height: 4, pixels: vec![200u8; 64] }.to_png();
+        let placed = s.execute("file.place", &json!({"base64": super::super::file::base64_encode(&png), "name": "a.png", "x": 72, "y": 72})).unwrap();
+        let (g, aid) = (ItemId(placed["id"].as_u64().unwrap()), designcraft_doc::AssetId(placed["asset"].as_u64().unwrap()));
+        let f = ItemId(s.execute("frame.create", &json!({"rect": [36, 200, 300, 400], "content": "text"})).unwrap()["id"].as_u64().unwrap());
+        s.edit(|d, _| {
+            let it = d.item(g).cloned().ok_or(designcraft_doc::DocError::NoItem(g))?;
+            let sid = d.item(f).and_then(|i| i.text_frame()).map(|t| t.story).ok_or(designcraft_doc::DocError::NoItem(f))?;
+            super::super::anchored::anchor_items(d, sid, 0, vec![it], &Default::default())?;
+            Ok(())
+        })
+        .unwrap();
+        s.execute("selection.set", &json!({"ids": [f.0]})).unwrap();
+        s.execute("edit.copy", &json!({})).unwrap();
+        let clip = s.clipboard.clone().unwrap();
+        assert_eq!(clip.assets.keys().copied().collect::<Vec<_>>(), [aid]);
+    }
+
+    /// A selection can name an object that is gone (here the copy that Undo removed). Copy
+    /// measures from the spread of the first selected object that is still there.
+    #[test]
+    fn copy_measures_from_the_first_selected_object_that_exists() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true})).unwrap();
+        let w = s.doc().unwrap().doc.settings.page_width;
+        let a = s.execute("frame.create", &json!({"spread": 1, "rect": [w + 36.0, 36, w + 136.0, 136]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("selection.set", &json!({"ids": [a]})).unwrap();
+        s.execute("edit.copy", &json!({})).unwrap();
+        let gone = s.execute("edit.paste", &json!({"spread": 1})).unwrap()["ids"][0].as_u64().unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().selection.items, [ItemId(a)], "Undo restores the selection from before the paste");
+        s.doc_mut().unwrap().selection.items = vec![ItemId(gone), ItemId(a)];
+        s.execute("edit.copy", &json!({})).unwrap();
+        assert_eq!(pasted(&mut s, "edit.pasteInPlace", json!({"spread": 1})), (SpreadRef::Doc(1), Rect::new(w + 36.0, 36.0, w + 136.0, 136.0)));
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    fn text_session() -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Hello"})).unwrap();
+        let sid = s.doc().unwrap().doc.item(ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 5})).unwrap();
+        s
+    }
+
+    fn size(s: &mut Session) -> f64 {
+        s.execute("type.selectionAttrs", &json!({})).unwrap()["chars"]["size"].as_f64().unwrap()
+    }
+
+    fn preview_size(s: &mut Session, v: f64) {
+        s.execute("edit.preview", &json!({"label": "Size", "command": "type.char", "params": {"attrs": {"size": v}}})).unwrap();
+    }
+
+    #[test]
+    fn previews_show_on_the_page_and_commit_as_one_undo_step() {
+        let mut s = text_session();
+        let (before, undo) = (size(&mut s), s.doc().unwrap().history.undo.len());
+        for v in [20.0, 30.0, 40.0] {
+            preview_size(&mut s, v);
+            assert_eq!(size(&mut s), v, "each preview replaces the last");
+        }
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo, "no undo step while previewing");
+        s.execute("edit.commitPreview", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+        assert!(s.doc().unwrap().interaction.is_none());
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(size(&mut s), before);
+    }
+
+    /// A preview whose command fails closes again, so the next edit is its own undo step.
+    #[test]
+    fn a_failed_preview_leaves_no_preview_open() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("edit.preview", &json!({"label": "Size", "command": "type.char", "params": {"attrs": {"size": 20}}}));
+        assert!(r.is_err(), "nothing selected: type.char fails");
+        assert!(s.doc().unwrap().interaction.is_none());
+        let steps = s.doc().unwrap().history.undo.len();
+        s.execute("frame.create", &json!({"rect": [72, 72, 144, 144]})).unwrap();
+        assert_eq!(s.doc().unwrap().history.undo.len(), steps + 1);
+    }
+
+    #[test]
+    fn a_cancelled_preview_leaves_the_document_as_it_was() {
+        let mut s = text_session();
+        let (before, undo) = (size(&mut s), s.doc().unwrap().history.undo.len());
+        preview_size(&mut s, 50.0);
+        s.execute("edit.cancelPreview", &json!({})).unwrap();
+        assert_eq!(size(&mut s), before);
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo);
+        // Committing with nothing open does nothing.
+        s.execute("edit.commitPreview", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo);
+    }
+
+    #[test]
+    fn only_edits_are_previewed_and_another_interaction_is_left_alone() {
+        let mut s = text_session();
+        for command in ["edit.preview", "edit.undo", "type.selectionAttrs", "no.such.command"] {
+            assert!(s.execute("edit.preview", &json!({"label": "X", "command": command})).is_err(), "{command}");
+        }
+        assert!(s.execute("edit.preview", &json!({"command": "type.char"})).is_err(), "needs a label");
+        s.begin_interaction("Move").unwrap();
+        assert!(s.execute("edit.preview", &json!({"label": "Size", "command": "type.char", "params": {"attrs": {"size": 20}}})).is_err());
+        assert_eq!(s.doc().unwrap().interaction.as_ref().unwrap().label, "Move");
     }
 }

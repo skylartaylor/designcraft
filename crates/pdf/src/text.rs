@@ -1,10 +1,16 @@
 //! Composed text → PDF text objects with embedded (subsetted) fonts.
 //!
-//! Each line is split into runs of glyphs sharing face, style, scale and baseline offset. A run is
-//! drawn with one `draw_glyphs` call: the run origin, horizontal scale and skew go into the
-//! transform, glyph advances are taken from the composed x positions (so justification, tracking
-//! and kerning are exact), and every glyph carries the story text it came from so viewers can
-//! select, search and copy it.
+//! Each line is split into runs of glyphs sharing face, style and scale. A run is drawn with one
+//! `draw_glyphs` call: the run origin, horizontal scale and skew go into the transform, glyph
+//! advances and offsets are taken from the composed positions (so justification, tracking, kerning
+//! and mark positioning are exact), and every glyph carries the story text it came from so viewers
+//! can select, search and copy it.
+//!
+//! Composed lines hold their glyphs in text order, so content streams list text in reading order
+//! even where right-to-left text is drawn leftwards. Right-to-left lines and runs carry no
+//! ActualText of their own: poppler orders right-to-left glyphs by itself, but it positions an
+//! ActualText with the transform in force where its span ends (losing a span over several runs)
+//! and reverses the characters of one in a right-to-left line.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -71,7 +77,83 @@ fn same_run(a: &PlacedGlyph, b: &PlacedGlyph) -> bool {
         && a.style == b.style
         && (a.sx - b.sx).abs() < 1e-9
         && (a.sy - b.sy).abs() < 1e-9
-        && (a.y - b.y).abs() < 1e-6
+}
+
+/// End of the run of `gs` that starts at `i`.
+fn run_end(ft: &FrameText, gs: &[PlacedGlyph], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < gs.len() && same_run(&gs[i], &gs[j]) && !(ft.vertical && (gs[j].upright || gs[j].tcy.is_some())) {
+        j += 1;
+    }
+    j
+}
+
+/// Clusters of several glyphs (a base and its marks, as in pointed Hebrew) map glyph by glyph
+/// when every glyph stands for one of the cluster's characters, and are drawn in text order:
+/// viewers that only read ToUnicode then get each character once, marks after their base. A
+/// glyph stands for a character when it is the font's glyph for it, or when both are marks (a
+/// mark's glyph may be a positional variant). Other clusters (ligatures, contextual forms) keep
+/// one shared range, which krilla writes as ActualText. Returns the order to draw the glyphs in.
+fn split_clusters(glyphs: &[PlacedGlyph], text: &str, ranges: &mut [Range<usize>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..glyphs.len()).collect();
+    let mut i = 0;
+    while i < ranges.len() {
+        let r = ranges[i].clone();
+        let mut j = i + 1;
+        while ranges.get(j).is_some_and(|n| *n == r) {
+            j += 1;
+        }
+        if let (Some(cluster), Some(members)) = (text.get(r.clone()).filter(|_| j - i > 1), glyphs.get(i..j))
+            && let Some(own) = cluster_chars(members, cluster)
+        {
+            for (m, (at, c)) in own.into_iter().enumerate() {
+                if let Some(range) = ranges.get_mut(i + m) {
+                    *range = r.start + at..r.start + at + c.len_utf8();
+                }
+            }
+            if let Some(o) = order.get_mut(i..j) {
+                o.sort_by_key(|&m| ranges.get(m).map_or(0, |r| r.start));
+            }
+        }
+        i = j;
+    }
+    order
+}
+
+/// The character (byte offset in `cluster`, char) each glyph of a cluster stands for, if each
+/// stands for a different one and all are covered.
+fn cluster_chars(members: &[PlacedGlyph], cluster: &str) -> Option<Vec<(usize, char)>> {
+    let chars: Vec<(usize, char)> = cluster.char_indices().collect();
+    if chars.len() != members.len() {
+        return None;
+    }
+    let mut own: Vec<Option<usize>> = vec![None; members.len()];
+    let mut used = vec![false; chars.len()];
+    for (m, g) in members.iter().enumerate() {
+        if let Some(k) = (0..chars.len()).find(|&k| !used[k] && g.face.glyph_for(chars[k].1) == g.gid) {
+            used[k] = true;
+            own[m] = Some(k);
+        }
+    }
+    // The remaining glyphs and characters must all be marks; they pair up in text order (a
+    // right-to-left cluster lists its glyphs right to left).
+    let mut rest: Vec<usize> = (0..members.len()).filter(|&m| own[m].is_none()).collect();
+    if members.first().is_some_and(|g| g.rtl) {
+        rest.reverse();
+    }
+    let marks: Vec<usize> = (0..chars.len()).filter(|&k| !used[k]).collect();
+    if rest.len() != marks.len() {
+        return None;
+    }
+    for (&m, &k) in rest.iter().zip(&marks) {
+        let g = members.get(m)?;
+        let c = chars.get(k)?.1;
+        if !g.face.glyph_is_mark(g.gid) || !g.face.glyph_is_mark(g.face.glyph_for(c)) {
+            return None;
+        }
+        own[m] = Some(k);
+    }
+    own.into_iter().map(|k| chars.get(k?).copied()).collect()
 }
 
 /// Merge bars of one paint layer; underlines and strikes must never be merged together.
@@ -154,9 +236,12 @@ impl Exporter<'_> {
     pub(crate) fn frame_text(&mut self, s: &mut Surface, cs: &ComposedStory, ft: &FrameText, story: &str) {
         // Paragraph shading and rules under the text.
         self.as_artifact(s, |me, s| {
-            for d in &ft.decos {
+            for d in ft.decos.iter().filter(|d| !d.nonprinting) {
                 if let Some(c) = me.swatch_color(&d.color, d.tint) {
-                    me.fill_rect(s, d.rect, c);
+                    match &d.path {
+                        Some(p) => me.fill_path(s, p, c),
+                        None => me.fill_rect(s, d.rect, c),
+                    }
                 }
             }
             if !ft.tables.is_empty() {
@@ -184,19 +269,18 @@ impl Exporter<'_> {
                     continue;
                 }
                 // Vertical type: an upright glyph turns back a quarter about its em box centre.
-                if ft.vertical
-                    && let Some(turn) = g.vertical_xf(l.baseline)
-                {
-                    s.push_transform(&crate::export::tf(turn));
+                // Shatai slants each glyph about its own em box centre first.
+                let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
+                let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
+                if turn.is_some() || shatai.is_some() {
+                    let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY);
+                    s.push_transform(&crate::export::tf(m));
                     self.tagged_run(s, cs, &gs[i..i + 1], l.baseline, story);
                     s.pop();
                     i += 1;
                     continue;
                 }
-                let mut j = i + 1;
-                while j < gs.len() && same_run(g, &gs[j]) && !(ft.vertical && (gs[j].upright || gs[j].tcy.is_some())) {
-                    j += 1;
-                }
+                let j = run_end(ft, gs, i);
                 self.tagged_run(s, cs, &gs[i..j], l.baseline, story);
                 i = j;
             }
@@ -249,23 +333,59 @@ impl Exporter<'_> {
             for seg in &t.strokes {
                 let st = &seg.stroke;
                 let Some(col) = self.swatch_color(&st.color, st.tint) else { continue };
-                let (cap, dash) = match &st.kind {
-                    designcraft_doc::StrokeType::Dashed { pattern } if pattern.iter().any(|v| *v > 0.0) => {
+                let kind = self.doc.stroke_kind(&st.kind);
+                let mut bp = BezPath::new();
+                bp.move_to(seg.a);
+                bp.line_to(seg.b);
+                let Some(p) = to_path(&bp) else { continue };
+                // Butt-ended fills close the table's corners the way square caps do.
+                let (ca, cb) = t.corner_capped(seg);
+                let mut capped = BezPath::new();
+                capped.move_to(ca);
+                capped.line_to(cb);
+                let Some(cp) = to_path(&capped) else { continue };
+                // Gap colour under dashes, dots and stripes: the whole edge, solid.
+                if !matches!(kind, designcraft_doc::StrokeType::Solid)
+                    && st.gap_color != designcraft_color::swatch::NONE
+                    && let Some(gap) = self.swatch_color(&st.gap_color, st.gap_tint)
+                {
+                    s.set_fill(None);
+                    s.set_stroke(Some(Stroke {
+                        paint: gap.into(),
+                        width: st.weight as f32,
+                        line_cap: krilla::paint::LineCap::Butt,
+                        ..Default::default()
+                    }));
+                    s.draw_path(&cp);
+                    s.set_stroke(None);
+                }
+                // Stripes, wavy and hash types are fills along the edge.
+                if let Some(o) = kind.outline(&capped, st.weight, 0.05)
+                    && let Some(op) = to_path(&o)
+                {
+                    s.set_stroke(None);
+                    s.set_fill(Some(solid_fill(col, 1.0)));
+                    s.draw_path(&op);
+                    s.set_fill(None);
+                    continue;
+                }
+                let (cap, dash) = match &kind {
+                    designcraft_doc::StrokeType::Dashed { pattern }
+                        if designcraft_doc::StrokeType::expandable_dashes(pattern, seg.a.distance(seg.b)) =>
+                    {
                         let mut pat: Vec<f32> = pattern.iter().map(|v| v.max(0.0) as f32).collect();
                         if pat.len() % 2 == 1 {
                             pat.extend(pat.clone());
                         }
                         (krilla::paint::LineCap::Butt, Some(krilla::paint::StrokeDash { array: pat, offset: 0.0 }))
                     }
-                    designcraft_doc::StrokeType::Dotted => {
+                    designcraft_doc::StrokeType::Dotted
+                        if designcraft_doc::StrokeType::expandable_dashes(&[0.0, st.weight * 2.0], seg.a.distance(seg.b)) =>
+                    {
                         (krilla::paint::LineCap::Round, Some(krilla::paint::StrokeDash { array: vec![0.0, (st.weight * 2.0) as f32], offset: 0.0 }))
                     }
                     _ => (krilla::paint::LineCap::Square, None),
                 };
-                let mut bp = BezPath::new();
-                bp.move_to(seg.a);
-                bp.line_to(seg.b);
-                let Some(p) = to_path(&bp) else { continue };
                 s.set_fill(None);
                 s.set_stroke(Some(Stroke { paint: col.into(), width: st.weight as f32, line_cap: cap, dash, ..Default::default() }));
                 s.draw_path(&p);
@@ -275,7 +395,11 @@ impl Exporter<'_> {
     }
 
     fn fill_rect(&self, s: &mut Surface, r: Rect, c: krilla::color::Color) {
-        if let Some(p) = to_path(&r.to_path(0.1)) {
+        self.fill_path(s, &r.to_path(0.1), c);
+    }
+
+    fn fill_path(&self, s: &mut Surface, bp: &designcraft_geom::BezPath, c: krilla::color::Color) {
+        if let Some(p) = to_path(bp) {
             s.set_stroke(None);
             s.set_fill(Some(solid_fill(c, 1.0)));
             s.draw_path(&p);
@@ -300,8 +424,23 @@ impl Exporter<'_> {
             } else if g.len == 0 && prev_src == Some(g.byte) && !ranges.is_empty() {
                 // Second glyph of a multi-glyph cluster: share the cluster's text.
                 ranges[ranges.len() - 1].clone()
+            } else if let Some(t) = g.generated_text.as_deref().filter(|t| !t.is_empty() && !t.chars().any(is_marker)) {
+                // Generated text (page numbers, list labels): its own characters, which a glyph
+                // the font substituted (small-cap or old-style figures) can't be mapped back to.
+                prev_src = None;
+                let a = text.len();
+                text.push_str(t);
+                a..text.len()
+            } else if g.generated_text.as_deref() == Some("") && !ranges.is_empty() {
+                // Later glyph of a generated cluster.
+                prev_src = None;
+                ranges[ranges.len() - 1].clone()
+            } else if g.len == 0 && cmap.get(&g.gid) == Some(&'\u{0640}') {
+                // A kashida that justification inserted: drawn, but no text of its own.
+                prev_src = None;
+                text.len()..text.len()
             } else {
-                // Inserted glyphs (page numbers, list labels, hyphens): map back through the font.
+                // Other inserted glyphs (hyphens, tab leaders, ruby): map back through the font.
                 prev_src = None;
                 match cmap.get(&g.gid) {
                     Some(c) => {
@@ -329,7 +468,8 @@ impl Exporter<'_> {
         let face = g0.face;
         let size = g0.sy * face.upem;
         let hs = g0.sx / g0.sy;
-        let skew = if st.skew != 0.0 { Affine::new([1.0, 0.0, -st.skew.to_radians().tan(), 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
+        let tan = if st.skew != 0.0 { st.skew.to_radians().tan() } else { 0.0 };
+        let skew = if st.skew != 0.0 { Affine::new([1.0, 0.0, -tan, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
         let origin = Affine::translate((g0.x, baseline + g0.y)) * skew * Affine::scale_non_uniform(hs, 1.0);
         // Outside a frame (no text area), a gradient spans the run.
         let end = glyphs.last().map_or(g0.x, |g| g.x + g.adv);
@@ -343,6 +483,9 @@ impl Exporter<'_> {
         if fill.is_none() && stroke.is_none() {
             return;
         }
+        if st.overprint_fill || st.overprint_stroke {
+            self.warn("overprint is not exported yet");
+        }
         // Stroke behind fill: a double-width stroke first, as outlines so the text is not
         // duplicated, then the fill over its inner half. With no fill, the stroke is clipped
         // to the outside of the glyphs instead.
@@ -350,7 +493,7 @@ impl Exporter<'_> {
         let weight = if behind { st.stroke_weight * 2.0 } else { st.stroke_weight };
         let mut clipped = false;
         let stroke = if behind {
-            let outlines = glyph_outlines(glyphs, size);
+            let outlines = glyph_outlines(glyphs, size, tan);
             if fill.is_some() {
                 self.paint_outlines(s, &outlines, origin, None, stroke, weight);
                 None
@@ -363,12 +506,12 @@ impl Exporter<'_> {
         };
         // A missing glyph is drawn as its box: PDF/A and PDF/UA forbid showing .notdef as text.
         if g0.gid == 0 {
-            self.paint_outlines(s, &glyph_outlines(glyphs, size), origin, fill, stroke, weight);
+            self.paint_outlines(s, &glyph_outlines(glyphs, size, tan), origin, fill, stroke, weight);
         } else if let Some(font) = self.font(&face) {
-            self.text_run(s, glyphs, story, font, origin, size, hs, fill, stroke, weight);
+            self.text_run(s, glyphs, story, font, origin, size, hs, tan, fill, stroke, weight);
         } else {
             self.warn(format!("font `{} {}` could not be embedded; its text was drawn as outlines", face.family, face.style));
-            self.paint_outlines(s, &glyph_outlines(glyphs, size), origin, fill, stroke, weight);
+            self.paint_outlines(s, &glyph_outlines(glyphs, size, tan), origin, fill, stroke, weight);
         }
         if clipped {
             s.pop();
@@ -386,25 +529,33 @@ impl Exporter<'_> {
         origin: Affine,
         size: f64,
         hs: f64,
+        tan: f64,
         fill: Option<Paint>,
         stroke: Option<Paint>,
         stroke_weight: f64,
     ) {
-        let (text, ranges) = self.run_text(glyphs, story);
+        let Some(g0) = glyphs.first() else { return };
+        let (text, mut ranges) = self.run_text(glyphs, story);
+        let order = split_clusters(glyphs, &text, &mut ranges);
         let k = 1.0 / (hs * size);
-        let kg: Vec<KrillaGlyph> = glyphs
+        // Glyphs are placed absolutely: each advance reaches the next glyph drawn, a vertical offset
+        // (a mark above or below its base) is undone by the skew so it lands where it was composed.
+        let kg: Vec<KrillaGlyph> = order
             .iter()
-            .zip(ranges)
             .enumerate()
-            .map(|(i, (g, r))| {
-                let next = glyphs.get(i + 1).map_or(g.x + g.adv, |n| n.x);
-                KrillaGlyph::new(GlyphId::new(g.gid), ((next - g.x) * k) as f32, 0.0, 0.0, 0.0, r, None)
+            .filter_map(|(n, &i)| {
+                let g = glyphs.get(i)?;
+                let next = order.get(n + 1).and_then(|&m| glyphs.get(m)).map_or(g.x + g.adv, |m| m.x);
+                let dy = g.y - g0.y;
+                let r = ranges.get(i)?.clone();
+                Some(KrillaGlyph::new(GlyphId::new(g.gid), ((next - g.x) * k) as f32, (tan * dy * k) as f32, (-dy / size) as f32, 0.0, r, None))
             })
             .collect();
+        let start = order.first().and_then(|&i| glyphs.get(i)).map_or(0.0, |g| (g.x - g0.x) / hs);
         s.push_transform(&tf(origin));
         s.set_fill(fill.map(paint_fill));
         s.set_stroke(stroke.map(|paint| Stroke { paint, width: stroke_weight as f32, ..Default::default() }));
-        s.draw_glyphs(Point::from_xy(0.0, 0.0), &kg, font, &text, size as f32, false);
+        s.draw_glyphs(Point::from_xy(start as f32, 0.0), &kg, font, &text, size as f32, false);
         s.set_fill(None);
         s.set_stroke(None);
         s.pop();
@@ -471,14 +622,16 @@ impl Exporter<'_> {
     }
 }
 
-/// A run's glyph outlines at `size`, relative to its first glyph's origin.
-fn glyph_outlines(glyphs: &[PlacedGlyph], size: f64) -> BezPath {
+/// A run's glyph outlines at `size`, relative to its first glyph's origin. A vertical offset (a
+/// mark above or below its base) is undone by the skew `tan` so it lands where it was composed.
+fn glyph_outlines(glyphs: &[PlacedGlyph], size: f64, tan: f64) -> BezPath {
     let db = FontDb::global();
     let mut bp = BezPath::new();
     let Some(g0) = glyphs.first() else { return bp };
     let k = size / g0.face.upem;
     for g in glyphs {
-        let a = Affine::translate(((g.x - g0.x) / (g0.sx / g0.sy), 0.0)) * Affine::scale(k);
+        let dy = g.y - g0.y;
+        let a = Affine::translate(((g.x - g0.x + tan * dy) / (g0.sx / g0.sy), dy)) * Affine::scale(k);
         let mut o = (*db.outline(&g.face, g.gid)).clone();
         o.apply_affine(a);
         bp.extend(o.iter());

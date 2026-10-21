@@ -13,7 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Cross-Reference…",
             ["Type", "Hyperlinks & Cross-References"],
             None,
-            "{anchor? | paragraph?: text to find (first paragraph containing it) | story? + para? (0-based), format?: name (default Full Paragraph & Page Number)} — at the insertion point; the text updates itself as the destination moves",
+            "{anchor? | paragraph?: text to find (first paragraph containing it) | story?: with para? | para?: 0-based paragraph of `story`, format?: name (default Full Paragraph & Page Number)} — at the insertion point; the text updates itself as the destination moves",
             in_story_text,
             insert
         ),
@@ -162,7 +162,7 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
         let st = d.story_mut(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
         let x = st.xrefs.get_mut(k).ok_or_else(|| bad("xref.setFormat", "no such cross-reference"))?;
         std::sync::Arc::make_mut(x).format = format;
-        st.rev += 1;
+        st.rev = st.rev.wrapping_add(1);
         Ok(Value::Null)
     })
 }

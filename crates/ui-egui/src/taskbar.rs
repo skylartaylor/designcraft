@@ -146,11 +146,11 @@ fn text_controls(app: &mut DesignApp, ui: &mut Ui, in_text: bool) {
     let shown = if fam.is_empty() { "—".to_string() } else { panels::font_label(app, &menu, &fam) };
     let field = widgets::dropdown(ui, &shown, 150.0);
     if let Some(f) = panels::font_popup(app, &field, &menu, &fam) {
-        panels::apply_font_family(app, &f);
+        panels::apply_font(app, &f);
     }
     let styles = fonts.styles(&fam);
     let cur = styles.iter().position(|s| *s == sty);
-    if let Some(k) = widgets::dropdown_list(ui, if sty.is_empty() { "—" } else { &sty }, 90.0, &styles, cur) {
+    if let Some(k) = widgets::dropdown_list(ui, &panels::style_shown(&sty), 90.0, &styles, cur) {
         let _ = app.run("type.char", json!({"attrs": {"fontStyle": styles[k]}}));
     }
     let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
@@ -164,7 +164,7 @@ fn text_controls(app: &mut DesignApp, ui: &mut Ui, in_text: bool) {
     if let Some(doc) = app.session.active().map(|d| d.doc.clone()) {
         let sw = c["fill"].as_str().unwrap_or("[Black]").to_string();
         let (col, g) = widgets::swatch_colors(&doc, &sw, 1.0);
-        let resp = widgets::swatch_chip(ui, 17.0, col, g).on_hover_text(format!("Fill: {sw}"));
+        let resp = widgets::swatch_chip(ui, 17.0, col, g).on_hover_text(format!("{}: {sw}", crate::i18n::tr(&app.ui.language, "Fill")));
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Task Bar fill"));
         let mut picked = None;
         egui::Popup::menu(&resp).show(|ui| {

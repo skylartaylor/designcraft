@@ -1,6 +1,6 @@
 # Where DesignCraft falls short of InDesign
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (bounded control click/drag input) · **Target:** Adobe InDesign 2026 (21.6)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-17 · **Change:** minor (gap 6 shrunk: Type › Reload Fonts reads fonts installed, edited or removed while running (#328); gap 3: Package links are relative, #340; gap 27 closed: the loaded text cursor threads into a frame inside a group (#1075); .indd and .indt open through indd-utils; gap 0 shrunk: text threads by hand; threading gaps added; Optical kerning from outlines (#181); gap 6: macOS lists fonts that font services and managers activate; shared print spooler; image clipping paths from IDML; Tabs panel listed as present (#343); book chapter update safety; gap 16: Based on Parent leftovers; bounded control click/drag input; swatches on placed greyscale and bitmap images) · **Target:** Adobe InDesign 2026 (21.6)
 
 Every known shortfall against InDesign 2026, one entry each, ranked by how much it stops an
 InDesign professional from doing real work. This is the work list: agents pick from the top.
@@ -39,22 +39,25 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 - **Estimate:** 30–50 h (reproduce per platform through the control channel, regression tests).
 - **Doc:** [ui-parity.md](ui-parity.md)
 
-### 2. InDesign documents (.indd) can't be opened (FF)
-- **Missing:** INDD (and INDT, INDB, INDL) reading. Everything InDesign users receive is INDD.
-- **Evidence:** #21. Two clean-room converters are proposed: PR #98 and `indd-utils` (#114),
-  which reports 96.9% of InDesign's IDML values reproduced on ~650 INDD/IDML pairs, 0 failures on
-  ~4,300 files, and output that DesignCraft's IDML importer already reads.
-- **Impact:** without it, every job starts with "ask the client for an IDML".
-- **Estimate:** 20–60 h to integrate indd-utils (INDD → IDML → existing importer), warnings UI,
-  corpus test; **owner decision** on provenance and where the crate lives.
+### 2. INDD opening isn't measured on real files (FF)
+- **Missing:** a real-file corpus test of opening `.indd` and `.indt`. They open through
+  [storytold/indd-utils](https://github.com/storytold/indd-utils), which converts them to IDML in
+  memory for the IDML importer, but DesignCraft's own tests use synthetic bytes only. INDB and
+  INDL are still not read.
+- **Evidence:** #21, #114 (PR #98 proposed another converter). indd-utils reports 96.9% of
+  InDesign's IDML values reproduced on ~650 INDD/IDML pairs and 0 failures on ~4,300 files; what
+  DesignCraft draws from those files is unmeasured, and it inherits the IDML importer's open bugs
+  (gap 3).
+- **Impact:** a client's `.indd` opens, but nobody knows how close it comes to the original.
+- **Estimate:** 10–30 h (corpus pinned in a sibling of `storytold/photocraft-corpus`, metric,
+  fixes in indd-utils or the IDML importer).
 - **Doc:** [file-format-parity.md](file-format-parity.md)
 
 ### 3. IDML round-trip isn't proven on real files (FF)
 - **Missing:** a corpus test of real InDesign-authored IDML (via `storytold/photocraft-corpus` or
   a sibling) measuring what survives import → export → reopen in InDesign. Open bugs: frames not
   rendered without a warning (#193), `$ID/` font names reported missing (#338), no
-  `PDFAttribute` on export (#339), Package writes build-machine absolute paths (#340), drag-drop
-  open of IDML on the app icon (#211).
+  `PDFAttribute` on export (#339), drag-drop open of IDML on the app icon (#211).
 - **Evidence:** importer coverage is broad (styles, tables, footnotes, xrefs, index, CJK, Arabic,
   verified in InDesign 2026 with synthetic files), but nothing is measured on real documents.
 - **Impact:** IDML is the main interchange format until INDD lands, and the only one that goes
@@ -65,13 +68,13 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 ### 4. Composition isn't compared with InDesign (T)
 - **Missing:** an oracle harness: the same synthetic stories set by InDesign 2026 (observed
   black-box, results kept under `plan/`) and by DesignCraft, comparing line breaks, overset and
-  frame fit. Known differences: optical kerning falls back to metrics, so imported text sets
-  wider (#181); a frame goes overset when descenders don't fit, InDesign needs only the baseline
+  frame fit. Known differences: optical kerning is an outline-based approximation, not Adobe's
+  algorithm (#181); a frame goes overset when descenders don't fit, InDesign needs only the baseline
   (#180); setting the text language was missing (#130; Language is now in Properties, #145, the issue is still open); "hyphenation doesn't work"
   (#87).
 - **Impact:** an opened IDML reflows: different line breaks, different page count, overset text.
   Professionals notice on the first page.
-- **Estimate:** 80–140 h (harness 20–30, optical kerning 15–25, then fixes by cluster).
+- **Estimate:** 70–125 h (harness 20–30, optical kerning tuning 5–10, then fixes by cluster).
 - **Doc:** [typography-parity.md](typography-parity.md)
 
 ### 5. Startup crashes on some graphics hardware (S, H)
@@ -79,13 +82,21 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
   AMD OpenGL driver crash on Windows (#167), launch failures (#273, #220, #192, #166), blank or
   frozen canvas after graphics loss (#90).
 - **Evidence:** a backend fallback landed 2026-10-10 (#297: DirectX 12 on Windows, `gpu.json`
-  skip list); not yet confirmed by the reporters.
+  skip list); then VectorCraft's adapter choice (the GPU that drives the display), restart on the
+  next adapter or backend when one fails or hangs at start-up, the indirect-call check off (the
+  first Metal error of #334) and a logged reason when the app stops (#273). Not yet confirmed by
+  the reporters. Still open for #334: wgpu asks an old macOS's Metal compiler for a language
+  version it doesn't have (`-std=metal3.2`).
 - **Estimate:** 15–30 h.
 - **Doc:** [hardware-parity.md](hardware-parity.md)
 
 ### 6. Installed fonts not always found (F)
-- **Missing:** fonts in user font folders used for text (#161, #110, #107), fonts activated by
-  font managers and Adobe Fonts (#327, #261), reload when fonts change on disk (#328).
+- **Missing:** fonts in user font folders used for text (#161, #110, #107), fonts that font
+  services and managers activate on Windows, noticing by itself when fonts change on disk (#328:
+  Type › Reload Fonts, `font.reload`, reads them again on request since 2026-10-16).
+- **Evidence:** on macOS the scan reads the font files CoreText has available, so fonts that
+  Adobe Fonts and font managers activate are listed (#261, #327, 2026-10-11); not yet confirmed
+  by the reporters.
 - **Impact:** documents set in the client's fonts render in Source Sans 3: wrong everywhere.
 - **Estimate:** 10–20 h (VectorCraft has a port, #261).
 - **Doc:** [typography-parity.md](typography-parity.md)
@@ -99,9 +110,9 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 
 ## High
 
-### 8. Canvas text input has no IME (U, L)
-- **Missing:** composition input for Chinese, Japanese and Korean on the canvas (#322).
-  VectorCraft has an implementation to port.
+### 8. Canvas IME not checked with real input methods (U, L)
+- **Have:** IME composition in the Type tool on macOS, Windows, Linux and the web (#322).
+- **Missing:** a check by hand with a system IME on each platform, and the fixes it finds.
 - **Estimate:** 10–20 h. **Doc:** [localization-parity.md](localization-parity.md)
 
 ### 9. PDF output presets and standards (FF)
@@ -120,18 +131,19 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 - **Estimate:** 25–45 h. **Doc:** [hardware-parity.md](hardware-parity.md)
 
 ### 11. Paragraph and character style editing reliability (F)
-- **Missing:** saving edits and deleting a paragraph style reported failing (#169); Tabs panel
-  for setting tab stops (#326).
+- **Missing:** saving edits and deleting a paragraph style reported failing (#169).
+- **Have:** the Tabs panel (Type › Tabs: a ruler over the text column, alignment, leader and
+  Align On) and a Tabs section in Paragraph Style Options (#343).
 - **Estimate:** 10–20 h. **Doc:** [ui-parity.md](ui-parity.md)
 
 ### 12. Tables in depth (F)
 - **Missing:** anchored objects in cells not drawn (#163); Table ▸ Table Options and Cell Options
-  submenus as InDesign lays them out, Diagonal Lines, Convert Rows to Header/Body/Footer, Edit
-  Header/Footer, Go to Row; general reliability (#20).
+  submenus as InDesign lays them out, Diagonal Lines, Edit Header/Footer,
+  Go to Row; general reliability (#20).
 - **Estimate:** 25–40 h.
 
 ### 13. Hyphenation and spelling languages (T, L)
-- **Missing:** hyphenation patterns for every language but English, Spanish, Portuguese and Norwegian; spelling for
+- **Missing:** hyphenation patterns for every language but English, Spanish, Portuguese, Norwegian and Greek; spelling for
   every language but English. InDesign ships dictionaries for ~40 languages.
 - **Estimate:** 30–60 h (permissively licensed patterns exist for most; spelling word lists need
   licence review). **Doc:** [typography-parity.md](typography-parity.md)
@@ -160,8 +172,10 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
   Window ▸ Arrange (2-up … 6-up), Trap Presets, Overlays, Edit ▸ Assign Profiles / Convert to
   Profile / Edit Original, File ▸ File Info / Open PDF / Document and Print Presets / User
   Settings, Type ▸ Size presets, Table ▸ Table Options / Cell Options submenus, Paste Before/After,
-  Convert Rows/Columns, Object ▸ Interactive ▸ Convert to (form fields),
-  View ▸ Extras badges and Story Editor options.
+  Convert Columns, Object ▸ Interactive ▸ Convert to (form fields),
+  View ▸ Extras badges and Story Editor options. Pages panel ▸ Parent Options (Based on Parent is
+  the `layout.parents.options` command only); overriding a base parent's items on a parent spread
+  itself (overrides work on document pages only).
 - **Estimate:** 40–70 h (most are thin wrappers over existing engine features).
 - **Doc:** [ui-parity.md](ui-parity.md)
 
@@ -177,8 +191,12 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 
 ### 19. Placed graphics depth (FF)
 - **Missing:** EPS is shown through its preview only (no PostScript interpreter); PSD layer
-  comps beyond visibility; Edit Original / Edit With; PDF placed as editable vectors (#227, #24);
-  QuarkXPress import (#73).
+  comps beyond visibility; the Clipping Path Options dialog (tracing into a clip that keeps the
+  frame, Threshold/Tolerance/Inset Frame preview, picking an alpha channel or a path saved in a
+  TIFF/PSD); Text Wrap › Same As Clipping following an imported clipping path; Edit Original / Edit With; PDF placed as editable vectors (#227, #24);
+  QuarkXPress import (#73); applying a swatch to a selected greyscale or bitmap image (Direct
+  Selection + Swatches). A swatch already on the image (IDML `<Image FillColor>`) colours it on
+  screen and in PDF and IDML export (#1094).
 - **Estimate:** 30–60 h (PostScript interpreter is a large separate project: +80–150 h).
 
 ### 20. Performance on large documents (P)
@@ -195,11 +213,6 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 - **Impact:** autoflowing into a document that already has pages inserts new pages in the
   middle of it instead of using the empty pages.
 - **Estimate:** 4–8 h.
-
-### 27. Loaded text cursor can't thread into a frame inside a group (F, U)
-- **Missing:** a click with the loaded text cursor on a text frame inside a group hits the group,
-  so the cursor shows it can't thread there.
-- **Estimate:** 2–4 h.
 
 ## Lower
 
@@ -236,6 +249,9 @@ Cue. These are excluded from every percentage.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-16 | minor | Gap 27 closed: the loaded text cursor threads into a text frame inside a group (#1075) |
+| 2026-10-16 | trivial | Gap 13 shrunk: Greek hyphenates, so five languages do (#1077) |
+| 2026-10-13 | minor | Gap 16: Parent Options dialog and overrides of base items on a parent spread |
 | 2026-10-12 | minor | Gap 0 shrunk to the Primary Text Frame page fixes (#165): text threads by hand; gaps added for autoflow onto existing pages and threading into grouped frames |
 | 2026-10-10 | minor | Gap 0 added and marked alpha blocker: manual text threading is missing (stage re-normalized to pre-alpha) |
 | 2026-10-10 | major | Created: 25 ranked gaps from the full re-measure against InDesign 2026 21.6 and issues #1–#352 |

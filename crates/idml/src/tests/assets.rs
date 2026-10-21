@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 
-use designcraft_doc::{AssetId, Content};
+use designcraft_doc::{AssetId, Content, PdfCrop};
 
 use super::*;
 
@@ -31,8 +31,9 @@ fn image(n: usize, uri: &str, contents: Option<&[u8]>) -> String {
     )
 }
 
-/// A graphic frame showing `pdf` (a `<PDF>` element) with the page `PageNumber` (1-based).
-fn pdf_frame(n: usize, x: f64, page: u32) -> String {
+/// A graphic frame showing `insert.pdf` (a `<PDF>` element) at page `PageNumber` (1-based),
+/// cropped to `crop` (`PDFCrop`).
+fn pdf_frame(n: usize, x: f64, page: u32, crop: &str) -> String {
     format!(
         r#"<Rectangle Self="r{n}" ItemLayer="L1" ItemTransform="1 0 0 1 {x} 0" ContentType="GraphicType">
       <Properties><PathGeometry><GeometryPathType PathOpen="false"><PathPointArray>
@@ -41,7 +42,7 @@ fn pdf_frame(n: usize, x: f64, page: u32) -> String {
       <PDF Self="im{n}" ItemTransform="1 0 0 1 {n} 0">
         <Properties><GraphicBounds Left="0" Top="0" Right="40" Bottom="30"/></Properties>
         <Link Self="lk{n}" LinkResourceURI="file:/art/insert.pdf" LinkResourceFormat="$ID/PDF" StoredState="Normal"/>
-        <PDFAttribute PageNumber="{page}" PDFCrop="CropMedia" TransparentBackground="true"/>
+        <PDFAttribute PageNumber="{page}" PDFCrop="{crop}" TransparentBackground="true"/>
       </PDF>
     </Rectangle>"#
     )
@@ -174,7 +175,7 @@ fn placed_svg_with_only_a_viewbox_keeps_its_viewbox_size() {
 fn a_pdf_placement_reads_its_page_number() {
     let bytes = b"%PDF-1.7\n% fixture".to_vec();
     let reader = |p: &str| p.ends_with("insert.pdf").then(|| bytes.clone());
-    let frames = vec![pdf_frame(1, 0.0, 2), pdf_frame(2, 100.0, 1), pdf_frame(3, 200.0, 2)];
+    let frames = vec![pdf_frame(1, 0.0, 2, "CropMedia"), pdf_frame(2, 100.0, 1, "CropMedia"), pdf_frame(3, 200.0, 2, "CropMedia")];
     let d = import_idml_with(&package(&frames), &reader).unwrap();
     let p = placements(&d);
     let page = |id| d.assets.get(&id).map(|a| a.page);
@@ -183,11 +184,89 @@ fn a_pdf_placement_reads_its_page_number() {
     assert_eq!(p[0].0, p[2].0, "the same file at the same page shares one asset");
     assert_ne!(p[0].0, p[1].0, "the same file at another page is another asset");
 
-    // Exported (linked or embedded), the page survives the round trip.
+    // Exported (linked or embedded), every placement writes its page and crop, page 1 included,
+    // and both survive the round trip.
     for embed_images in [false, true] {
         let out = export_idml_with(&d, &ExportOptions { embed_images });
+        let spreads = super::zip_text(&out, "Spreads/");
+        assert_eq!(spreads.matches(r#"PDFCrop="CropMedia""#).count(), 3, "{spreads}");
+        assert!(spreads.contains(r#"PageNumber="1""#) && spreads.contains(r#"PageNumber="2""#), "{spreads}");
         let back = import_idml_with(&out, &reader).unwrap();
-        let pages: Vec<_> = placements(&back).iter().map(|(id, _, _)| back.assets.get(id).map(|a| a.page)).collect();
-        assert_eq!(pages, vec![Some(1), Some(0), Some(1)], "embed_images: {embed_images}");
+        let shown: Vec<_> = placements(&back).iter().map(|(id, _, _)| back.assets.get(id).map(|a| (a.page, a.pdf_crop))).collect();
+        let (first, second) = (Some((0, PdfCrop::Media)), Some((1, PdfCrop::Media)));
+        assert_eq!(shown, vec![second, first, second], "embed_images: {embed_images}");
     }
+}
+
+/// Two crops of one linked PDF page are two assets, so each frame keeps its own crop; the same
+/// page and crop placed again shares an asset, and the file is read once per page and crop.
+#[test]
+fn a_pdf_page_placed_with_two_crops_imports_as_two_assets() {
+    let bytes = b"%PDF-1.7\n% fixture".to_vec();
+    let reads = Cell::new(0);
+    let reader = |p: &str| {
+        reads.set(reads.get() + 1);
+        p.ends_with("insert.pdf").then(|| bytes.clone())
+    };
+    let frames = vec![pdf_frame(1, 0.0, 1, "CropTrim"), pdf_frame(2, 100.0, 1, "CropMedia"), pdf_frame(3, 200.0, 1, "CropTrim")];
+    let d = import_idml_with(&package(&frames), &reader).unwrap();
+    let p = placements(&d);
+    let crop = |id| d.assets.get(&id).map(|a| (a.page, a.pdf_crop));
+    assert_eq!(crop(p[0].0), Some((0, PdfCrop::Trim)));
+    assert_eq!(crop(p[1].0), Some((0, PdfCrop::Media)));
+    assert_ne!(p[0].0, p[1].0, "another crop of the same page is another asset");
+    assert_eq!(p[0].0, p[2].0, "the same page and crop share one asset");
+    assert_eq!(d.assets.len(), 2);
+    assert_eq!(reads.get(), 2);
+}
+
+/// The swatch applied to a placed image (`<Image FillColor FillTint>`) colours a greyscale or
+/// bitmap image in InDesign (#1094). Black at 100%, InDesign's own value for an image nobody
+/// coloured, and None leave the image as it is, like a missing attribute.
+#[test]
+fn the_swatch_applied_to_an_image_is_kept() {
+    let bytes = vec![42u8; 300];
+    let reader = |p: &str| p.ends_with("couple.jpg").then(|| bytes.clone());
+    let coloured = |n: usize, attrs: &str| image(n, PHOTO, None).replacen(&format!(r#"Self="im{n}""#), &format!(r#"Self="im{n}" {attrs}"#), 1);
+    let frames = vec![
+        frame(1, 0.0, 0.0, &coloured(1, r#"FillColor="Color/Brand" FillTint="50""#)),
+        frame(2, 100.0, 0.0, &coloured(2, r#"FillColor="Color/Black" FillTint="-1""#)),
+        frame(3, 200.0, 0.0, &coloured(3, r#"FillColor="Swatch/None""#)),
+        frame(4, 300.0, 0.0, &image(4, PHOTO, None)),
+        frame(5, 400.0, 0.0, &coloured(5, r#"FillColor="Color/u9""#)),
+        frame(6, 500.0, 0.0, &coloured(6, r#"FillColor="Color/Black" FillTint="40""#)),
+    ];
+    let fills = |d: &Document| {
+        let mut v: Vec<(f64, (String, f32))> = d.spreads[0]
+            .items
+            .iter()
+            .filter_map(|i| match &i.content {
+                Content::Graphic(g) => Some((i.xf.translation().x, (g.fill.swatch.clone(), g.fill.tint))),
+                _ => None,
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.into_iter().map(|(_, f)| f).collect::<Vec<_>>()
+    };
+    let none = || (designcraft_color::swatch::NONE.to_string(), 1.0);
+    let want = vec![
+        ("Brand".to_string(), 0.5),
+        none(),
+        none(),
+        none(),
+        ("C=10 M=20 Y=30 K=40".to_string(), 1.0),
+        (designcraft_color::swatch::BLACK.to_string(), 0.4),
+    ];
+    let d = import_idml_with(&package(&frames), &reader).unwrap();
+    assert_eq!(fills(&d), want);
+
+    let out = export_idml_with(&d, &ExportOptions::default());
+    let spreads = zip_text(&out, "Spreads/");
+    let images: Vec<&str> = spreads.split("<Image ").skip(1).map(|s| s.split('>').next().unwrap_or("")).collect();
+    assert_eq!(images.len(), 6);
+    // Only an image with a swatch says so; none of them gets an invented `Swatch/None`.
+    assert_eq!(images.iter().filter(|e| e.contains("FillColor=")).count(), 3, "{images:?}");
+    assert!(images.iter().any(|e| e.contains(r#"FillColor="Color/Brand""#) && e.contains(r#"FillTint="50""#)), "{images:?}");
+    assert!(!images.iter().any(|e| e.contains("Swatch/None")), "{images:?}");
+    assert_eq!(fills(&import_idml_with(&out, &reader).unwrap()), want);
 }

@@ -562,7 +562,7 @@ mod tests {
         let c = s.execute("flex.add", &json!({})).unwrap()["id"].as_u64().unwrap();
         s.execute("flex.set", &json!({"direction": "columnReverse", "wrap": true, "padding": [1, 2, 3, 4], "gapV": 7})).unwrap();
         let d = s.doc().unwrap().doc.clone();
-        let back = crate::cmd::from_bytes(&crate::cmd::to_bytes(&d)).unwrap();
+        let back = crate::cmd::from_bytes(&crate::cmd::to_bytes(&d).unwrap()).unwrap();
         assert_eq!(back.item(ItemId(c)).unwrap().flex, d.item(ItemId(c)).unwrap().flex);
         assert!(back.item(ItemId(c)).unwrap().flex.is_some());
     }

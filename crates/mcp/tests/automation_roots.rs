@@ -277,7 +277,9 @@ fn every_writing_command_is_refused_outside_the_write_root() {
         ok(&mut server, tool, json!({"path": inside(&format!("{tool}.png"))}));
         assert!(base.join("out").join(format!("{tool}.png")).exists(), "{tool}");
     }
-    for file in ["out-file.save", "out-file.exportPdf", "out-file.exportIdml", "out-book.exportPdf", "out-swatch.save", "out-snippet.export"] {
+    for file in
+        ["out-file.save.designcraft", "out-file.exportPdf", "out-file.exportIdml", "out-book.exportPdf", "out-swatch.save", "out-snippet.export"]
+    {
         assert!(base.join("out").join(file).exists(), "{file}");
     }
     assert!(base.join("out/dir-file.package/Instructions.txt").exists() && base.join("out/dir-links.copyTo/pic.png").exists());

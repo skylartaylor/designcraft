@@ -98,6 +98,10 @@ pub struct Page {
     pub x: f64,
     pub margins: Margins,
     pub columns: Columns,
+    /// Margins and columns set on this page itself. Without them a document page takes its
+    /// parent page's margins and columns and follows their changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_margins: bool,
     /// Applied parent spread (`None` = [None]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<SpreadId>,
@@ -229,6 +233,10 @@ impl Page {
     pub fn bounds(&self) -> Rect {
         Rect::new(self.x, 0.0, self.x + self.width, self.height)
     }
+    /// Same margins and columns as `other`.
+    pub fn same_margins(&self, other: &Page) -> bool {
+        self.margins == other.margins && self.columns == other.columns
+    }
     /// Left and right margins resolved for the page side (inside is at the spine).
     pub fn left_right_margins(&self) -> (f64, f64) {
         match self.side {
@@ -293,6 +301,32 @@ impl Spread {
     pub fn bounds(&self) -> Rect {
         self.pages.iter().map(Page::bounds).reduce(|a, b| a.union(b)).unwrap_or(Rect::ZERO)
     }
+    /// The bleed guide: one rectangle around the spread. None without pages or without any bleed.
+    pub fn bleed_rect(&self, bleed: [f64; 4]) -> Option<Rect> {
+        self.outset_rect(bleed)
+    }
+    /// The slug guide. Slug offsets are measured from the page edges, like the bleed, so a slug
+    /// narrower than the bleed sits inside it, as in InDesign. None without pages or without any
+    /// slug.
+    pub fn slug_rect(&self, slug: [f64; 4]) -> Option<Rect> {
+        self.outset_rect(slug)
+    }
+    /// The spread's bounds grown by a document outset (the bleed or the slug): top, bottom,
+    /// inside, outside; the inside value applies only at an outer edge on the spine side (a lone
+    /// left page's right edge). The outer edges are the leftmost and rightmost pages, whichever
+    /// binding ordered the list.
+    pub fn outset_rect(&self, outset: [f64; 4]) -> Option<Rect> {
+        let (l, r) = self.outer_page_indices()?;
+        let (first, last) = (self.pages.get(l)?, self.pages.get(r)?);
+        if !outset.iter().any(|v| *v > 0.0) {
+            return None;
+        }
+        let [top, bottom, inside, outside] = outset;
+        let l = if first.side == PageSide::Left { outside } else { inside };
+        let r = if matches!(last.side, PageSide::Right | PageSide::Single) { outside } else { inside };
+        let b = self.bounds();
+        Some(Rect::new(b.x0 - l, b.y0 - top, b.x1 + r, b.y1 + bottom))
+    }
     /// x of the spine (between left and right pages) or the page centre for single pages.
     pub fn spine_x(&self) -> f64 {
         match self.pages.iter().position(|p| p.side == PageSide::Right) {
@@ -302,6 +336,25 @@ impl Spread {
             None => self.bounds().center().x,
         }
     }
+    /// Indices of the leftmost and rightmost pages. A right-to-left bound spread lists its right
+    /// page first, so list order says nothing about position.
+    pub fn outer_page_indices(&self) -> Option<(usize, usize)> {
+        let mut it = self.pages.iter().enumerate();
+        let (first, _) = it.next()?;
+        Some(it.fold((first, first), |(l, r), (i, p)| (if p.x < self.pages[l].x { i } else { l }, if p.x > self.pages[r].x { i } else { r })))
+    }
+    /// The parent page (index into this parent spread) shown behind a document page on `side`:
+    /// the leftmost page for a left page and the rightmost for a right page, whichever binding
+    /// ordered the list; the first page for a single-sided page or a one-page parent.
+    pub fn parent_page_for_side(&self, side: PageSide) -> Option<usize> {
+        let (l, r) = self.outer_page_indices()?;
+        match side {
+            _ if self.pages.len() < 2 => Some(l),
+            PageSide::Left => Some(l),
+            PageSide::Right => Some(r),
+            PageSide::Single => Some(0),
+        }
+    }
     /// Index of the page under spread x (nearest page for the pasteboard).
     pub fn page_at_x(&self, x: f64) -> Option<usize> {
         if self.pages.is_empty() {
@@ -309,9 +362,7 @@ impl Spread {
         }
         self.pages.iter().position(|p| x >= p.x && x < p.x + p.width).or_else(|| {
             // The pasteboard: the page nearest that side.
-            let (l, r) = (0..self.pages.len()).fold((0, 0), |(l, r), i| {
-                (if self.pages[i].x < self.pages[l].x { i } else { l }, if self.pages[i].x > self.pages[r].x { i } else { r })
-            });
+            let (l, r) = self.outer_page_indices()?;
             Some(if x < self.pages[l].x { l } else { r })
         })
     }
@@ -333,6 +384,9 @@ impl Spread {
         }
     }
 }
+
+/// The highest start page number a document or section accepts.
+pub const MAX_PAGE_NUMBER: u32 = 99_999;
 
 /// A numbering section starting at a document page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -365,6 +419,7 @@ mod tests {
             x,
             margins: Margins { top: 36.0, bottom: 36.0, inside: 54.0, outside: 36.0 },
             columns: Columns { count: 2, gutter: 12.0, positions: None },
+            local_margins: false,
             parent: None,
             side,
             overridden: vec![],
@@ -408,6 +463,23 @@ mod tests {
         assert_eq!(s.page_at_x(700.0), Some(1));
         assert_eq!(s.page_at_x(-50.0), Some(0));
         assert_eq!(s.page_at_x(5000.0), Some(1));
+    }
+
+    /// The outside bleed goes on the leftmost and rightmost pages, also when right-to-left
+    /// binding lists the right page first.
+    #[test]
+    fn bleed_rect_uses_the_outer_pages() {
+        let bleed = [1.0, 2.0, 3.0, 4.0];
+        for pages in [vec![page(PageSide::Left, 0.0), page(PageSide::Right, 612.0)], vec![page(PageSide::Right, 612.0), page(PageSide::Left, 0.0)]] {
+            let s = Spread { id: SpreadId(1), pages, items: vec![], parent: None, allow_shuffle: true };
+            assert_eq!(s.bleed_rect(bleed), Some(Rect::new(-4.0, -1.0, 1228.0, 794.0)));
+            assert_eq!(s.bleed_rect([0.0; 4]), None);
+            // The slug is measured the same way, from the page edges.
+            assert_eq!(s.slug_rect(bleed), s.bleed_rect(bleed));
+            assert_eq!(s.slug_rect([0.0; 4]), None);
+        }
+        let lone_left = Spread { id: SpreadId(1), pages: vec![page(PageSide::Left, 0.0)], items: vec![], parent: None, allow_shuffle: true };
+        assert_eq!(lone_left.bleed_rect(bleed), Some(Rect::new(-4.0, -1.0, 615.0, 794.0)));
     }
 }
 

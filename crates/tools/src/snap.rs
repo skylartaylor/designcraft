@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use designcraft_doc::{Item, ItemId, Orientation, PageSide, Selection, SpreadId, SpreadRef, StrokeAlign};
+use designcraft_doc::{Document, Item, ItemId, Orientation, Selection, SpreadRef, StrokeAlign};
 use designcraft_geom::snap::snap_to_grid;
 use designcraft_geom::{Affine, Point, Rect, Vec2, format_measure};
 
@@ -206,15 +206,13 @@ fn match_rotation(cx: &ToolContext, req: &SnapRequest<'_>, zone_length: f64) -> 
             push_rotation(&mut best, cx.selection, req, item, Affine::IDENTITY, false, 0, &mut seen, proposed, tol);
         }
     }
-    // Parent editing already lists those items on the spread. Do not add them again.
-    if !layout_edits_parents(cx) {
+    if shows_parent_items(cx, req) {
         push_parent_rotations(&mut best, cx, req, &mut seen, proposed, tol);
     }
     best.map(|(_, angle)| angle)
 }
 
-/// Shown parent items, same page and `based_on` walk as parent lengths.
-/// Parent items are only translated onto the page, so the angle is still `item.xf`.
+/// Shown parent items. Parent items are only translated onto the page, so the angle is still `item.xf`.
 fn push_parent_rotations(
     best: &mut Option<(f64, f64)>,
     cx: &ToolContext,
@@ -223,55 +221,9 @@ fn push_parent_rotations(
     proposed: f64,
     tol: f64,
 ) {
-    let SpreadRef::Doc(si) = req.spread else { return };
-    let page_count = cx.doc.spreads.get(si).map(|sp| sp.pages.len()).unwrap_or(0);
-    let first = cx.doc.first_page_of_spread(si);
-    for pi in 0..page_count {
-        let Some(abs) = first.checked_add(pi) else { continue };
-        let Some(page) = cx.doc.page(abs) else { continue };
-        if !page.show_parent_items {
-            continue;
-        }
-        let doc_side = page.side;
-        let overridden = page.overridden.clone();
-        let Some((ppi, _)) = cx.doc.parent_page_for(abs) else { continue };
-        let mut seen_spreads = HashSet::new();
-        push_parent_rotation_chain(best, cx, req, doc_side, &overridden, ppi, seen_items, &mut seen_spreads, proposed, tol);
+    for (item, _) in shown_parent_items(cx.doc, req.spread) {
+        push_rotation(best, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items, proposed, tol);
     }
-}
-
-fn push_parent_rotation_chain(
-    best: &mut Option<(f64, f64)>,
-    cx: &ToolContext,
-    req: &SnapRequest<'_>,
-    doc_side: PageSide,
-    overridden: &[ItemId],
-    index: usize,
-    seen_items: &mut HashSet<ItemId>,
-    seen_spreads: &mut HashSet<SpreadId>,
-    proposed: f64,
-    tol: f64,
-) {
-    let Some(parent) = cx.doc.parents.get(index) else { return };
-    if !seen_spreads.insert(parent.id) {
-        return;
-    }
-    let next = parent.parent.as_ref().and_then(|info| info.based_on);
-    if let Some(page_idx) = shown_parent_page_index(parent.pages.len(), doc_side) {
-        for item in &parent.items {
-            if overridden.contains(&item.id) {
-                continue;
-            }
-            // A facing parent only shows items whose center sits on this document page's parent page.
-            if parent.pages.len() > 1 && parent.page_at_x(item.bounds().center().x) != Some(page_idx) {
-                continue;
-            }
-            push_rotation(best, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items, proposed, tol);
-        }
-    }
-    let Some(next_id) = next else { return };
-    let Some(next_index) = cx.doc.parent_index(next_id) else { return };
-    push_parent_rotation_chain(best, cx, req, doc_side, overridden, next_index, seen_items, seen_spreads, proposed, tol);
 }
 
 fn push_rotation(
@@ -374,12 +326,16 @@ fn format_angle(deg: f64) -> String {
     if nearest.is_finite() && (deg - nearest).abs() < 1e-6 { format!("{nearest:.0}") } else { format!("{deg:.1}") }
 }
 
+/// The baseline grid comes last: its lines are dense and it snaps while hidden, so ahead of
+/// smart guides it would take nearly every vertical move and draw nothing (#188). Only when a
+/// guide or margin is in reach does the nearer of it and the baseline grid win.
 fn first_on_axis(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
     pass_grid(cx, req, axis, tol)
-        .or_else(|| nearer(pass_baseline(cx, req, axis, tol), pass_guides(cx, req, axis, tol)))
+        .or_else(|| pass_guides(cx, req, axis, tol).and_then(|g| nearer(pass_baseline(cx, req, axis, tol), Some(g))))
         .or_else(|| pass_align(cx, req, axis, tol))
         .or_else(|| pass_spacing(cx, req, axis, tol))
         .or_else(|| pass_dimensions(cx, req, axis, tol))
+        .or_else(|| pass_baseline(cx, req, axis, tol))
 }
 
 /// The baseline grid and the guides (ruler guides, margins, columns) compete by distance, so a
@@ -536,7 +492,8 @@ fn offer_enabled(best: &mut Option<Best>, moving: Rect, flags: [bool; 3], axis: 
 /// stationary box. A box counts only when its range overlaps on the other axis. The nearest
 /// box on a side that overlaps the mover, or a zero gap, produces no gap, and a farther box
 /// is not used instead. A candidate shifts the mover so one of its gaps equals one stationary
-/// nearest-neighbor gap. The shift has to fall inside the zone. The closest shift wins.
+/// nearest-neighbor gap, or, with a box on both sides, so its two gaps are equal (centered
+/// between them). The shift has to fall inside the zone. The closest shift wins.
 /// One gap overlay is drawn for every gap of that length, including the moving gap after the
 /// shift. Create, resize, rotate, and point do not match.
 fn pass_spacing(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
@@ -549,19 +506,21 @@ fn pass_spacing(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -
     let mover = interval_on(req.rect, axis)?;
     let boxes = spacing_intervals(cx, req, axis, &mover);
     let stationary = stationary_gaps(&boxes);
-    if stationary.is_empty() {
-        return None;
-    }
+    let low = nearest_side(&mover, &boxes, None, true);
+    let high = nearest_side(&mover, &boxes, None, false);
     let mut best: Option<SpacingChoice> = None;
-    if let Some(n) = nearest_side(&mover, &boxes, None, true) {
+    if let Some(n) = &low {
         for g in &stationary {
             offer_spacing(&mut best, g.gap - n.gap, g.gap, tol);
         }
     }
-    if let Some(n) = nearest_side(&mover, &boxes, None, false) {
+    if let Some(n) = &high {
         for g in &stationary {
             offer_spacing(&mut best, n.gap - g.gap, g.gap, tol);
         }
+    }
+    if let (Some(l), Some(h)) = (&low, &high) {
+        offer_spacing(&mut best, (h.gap - l.gap) * 0.5, (l.gap + h.gap) * 0.5, tol);
     }
     let choice = best?;
     let shifted = Interval { lo: mover.lo + choice.delta, hi: mover.hi + choice.delta, perp_lo: mover.perp_lo, perp_hi: mover.perp_hi };
@@ -949,7 +908,7 @@ fn dimension_lengths(cx: &ToolContext, req: &SnapRequest<'_>) -> Vec<f64> {
             push_own_lengths(&mut out, cx.selection, req, item, Affine::IDENTITY, false, 0, &mut seen);
         }
     }
-    if !layout_edits_parents(cx) {
+    if shows_parent_items(cx, req) {
         push_parent_lengths(&mut out, cx, req, &mut seen);
     }
     out
@@ -1032,59 +991,16 @@ fn stroke_outset(item: &Item) -> f64 {
 }
 
 fn push_parent_lengths(out: &mut Vec<f64>, cx: &ToolContext, req: &SnapRequest<'_>, seen_items: &mut HashSet<ItemId>) {
-    let SpreadRef::Doc(si) = req.spread else { return };
-    let page_count = cx.doc.spreads.get(si).map(|sp| sp.pages.len()).unwrap_or(0);
-    let first = cx.doc.first_page_of_spread(si);
-    for pi in 0..page_count {
-        let Some(abs) = first.checked_add(pi) else { continue };
-        let Some(page) = cx.doc.page(abs) else { continue };
-        if !page.show_parent_items {
-            continue;
-        }
-        let doc_side = page.side;
-        let overridden = page.overridden.clone();
-        let Some((ppi, _)) = cx.doc.parent_page_for(abs) else { continue };
-        let mut seen_spreads = HashSet::new();
-        push_parent_length_chain(out, cx, req, doc_side, &overridden, ppi, seen_items, &mut seen_spreads);
+    for (item, _) in shown_parent_items(cx.doc, req.spread) {
+        push_own_lengths(out, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items);
     }
-}
-
-fn push_parent_length_chain(
-    out: &mut Vec<f64>,
-    cx: &ToolContext,
-    req: &SnapRequest<'_>,
-    doc_side: PageSide,
-    overridden: &[ItemId],
-    index: usize,
-    seen_items: &mut HashSet<ItemId>,
-    seen_spreads: &mut HashSet<SpreadId>,
-) {
-    let Some(parent) = cx.doc.parents.get(index) else { return };
-    if !seen_spreads.insert(parent.id) {
-        return;
-    }
-    let next = parent.parent.as_ref().and_then(|info| info.based_on);
-    if let Some(page_idx) = shown_parent_page_index(parent.pages.len(), doc_side) {
-        for item in &parent.items {
-            if overridden.contains(&item.id) {
-                continue;
-            }
-            if parent.pages.len() > 1 && parent.page_at_x(item.bounds().center().x) != Some(page_idx) {
-                continue;
-            }
-            push_own_lengths(out, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items);
-        }
-    }
-    let Some(next_id) = next else { return };
-    let Some(next_index) = cx.doc.parent_index(next_id) else { return };
-    push_parent_length_chain(out, cx, req, doc_side, overridden, next_index, seen_items, seen_spreads);
 }
 
 /// Ruler guides, margins, and column sides. No overlay.
 ///
 /// A page guide attracts when the moving rect overlaps that page on the other axis. A spread
-/// guide uses the spread bounds. Locked guides are included. A guide is a target only when
-/// `Guide::visible_in` accepts it.
+/// guide uses the spread bounds. Locked guides are included, and so are the guides a page shows
+/// from its parent page. A guide is a target only when `Guide::visible_in` accepts it.
 fn pass_guides(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
     if !cx.snap.snap_to_guides || !cx.snap.show_guides {
         return None;
@@ -1094,15 +1010,10 @@ fn pass_guides(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) ->
     let flags = axis_flags(req, axis);
     let (moving_lo, moving_hi) = perp_ends(req.rect, axis);
     let mut best: Option<Best> = None;
-    let first_abs = match req.spread {
-        SpreadRef::Doc(si) => Some(cx.doc.first_page_of_spread(si)),
-        _ => None,
-    };
-    for (pidx, page) in sp.pages.iter().enumerate() {
+    for page in &sp.pages {
         let page_bounds = page.bounds();
-        // Guides set on the applied parent page count as this page's guides.
-        let inherited = first_abs.map(|f| cx.doc.inherited_guides(f + pidx)).unwrap_or_default();
-        for guide in page.guides.iter().chain(inherited.iter()) {
+        // The page's own guides, then those it shows from its parent page.
+        for guide in page.guides.iter().cloned().chain(cx.doc.parent_guides(page)) {
             if !guide.visible_in(cx.doc) || !guide.position.is_finite() || guide.orientation != axis_orientation(axis) {
                 continue;
             }
@@ -1125,6 +1036,18 @@ fn pass_guides(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) ->
                 offer_line(&mut best, req.rect, flags, axis, column.x0, tol);
                 offer_line(&mut best, req.rect, flags, axis, column.x1, tol);
             }
+        }
+    }
+    // The bleed guide's four sides, like InDesign's bleed guides.
+    if let Some(bleed) = sp.bleed_rect(cx.doc.settings.bleed) {
+        let (range_lo, range_hi) = perp_ends(bleed, axis);
+        if ranges_overlap(moving_lo, moving_hi, range_lo, range_hi) {
+            let (a, b) = match axis {
+                Axis::X => (bleed.x0, bleed.x1),
+                Axis::Y => (bleed.y0, bleed.y1),
+            };
+            offer_line(&mut best, req.rect, flags, axis, a, tol);
+            offer_line(&mut best, req.rect, flags, axis, b, tol);
         }
     }
     best.map(|b| b.hit)
@@ -1160,7 +1083,7 @@ fn pass_align(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> 
             offer_box(&mut best, req.rect, flags, axis, rect, tol, cx.snap.align_edges, cx.snap.align_centers);
         }
     }
-    if !layout_edits_parents(cx) {
+    if shows_parent_items(cx, req) {
         offer_parent_items(&mut best, cx, req, flags, axis, tol);
     }
     best.map(|b| b.hit)
@@ -1174,6 +1097,12 @@ fn align_skips_item(selection: &Selection, req: &SnapRequest<'_>, id: ItemId) ->
 /// Parent spreads are the canvas while a parent is being edited. Their items are ordinary targets.
 fn layout_edits_parents(cx: &ToolContext) -> bool {
     cx.layout.slots.iter().any(|slot| matches!(slot.spread, SpreadRef::Parent(_)))
+}
+
+/// Whether to offer the parent items drawn on `req.spread`. A parent spread shows its bases' items,
+/// which are not on it.
+fn shows_parent_items(cx: &ToolContext, req: &SnapRequest<'_>) -> bool {
+    matches!(req.spread, SpreadRef::Parent(_)) || !layout_edits_parents(cx)
 }
 
 /// Visible box used for alignment. Groups with children contribute the union of the children.
@@ -1245,73 +1174,44 @@ fn group_box(item: &Item, seen: &mut HashSet<ItemId>, depth: usize, filter: Opti
     acc.filter(|r| rect_finite(*r))
 }
 
-/// Parent items shown on the document spread, shifted into that spread's space.
+/// Parent items shown on the spread, shifted into that spread's space.
 fn offer_parent_items(best: &mut Option<Best>, cx: &ToolContext, req: &SnapRequest<'_>, flags: [bool; 3], axis: Axis, tol: f64) {
-    let SpreadRef::Doc(si) = req.spread else { return };
-    let page_count = cx.doc.spreads.get(si).map(|sp| sp.pages.len()).unwrap_or(0);
-    let first = cx.doc.first_page_of_spread(si);
-    for pi in 0..page_count {
-        let Some(abs) = first.checked_add(pi) else { continue };
-        let Some(page) = cx.doc.page(abs) else { continue };
+    for (item, dx) in shown_parent_items(cx.doc, req.spread) {
+        let Some(rect) = item_target_rect(cx.selection, req, item) else { continue };
+        offer_box(best, req.rect, flags, axis, shift_x(rect, dx), tol, cx.snap.align_edges, cx.snap.align_centers);
+    }
+}
+
+/// Parent items drawn on `spread`, back to front, each with the x shift from its parent spread:
+/// a document page's parent and its bases, or a parent spread's bases. Same page and override
+/// filters as the renderer.
+fn shown_parent_items(doc: &Document, spread: SpreadRef) -> Vec<(&Item, f64)> {
+    let Some(sp) = doc.spread(spread) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (pi, page) in sp.pages.iter().enumerate() {
         if !page.show_parent_items {
             continue;
         }
-        let doc_x = page.x;
-        let doc_side = page.side;
-        let overridden = page.overridden.clone();
-        let Some((ppi, _)) = cx.doc.parent_page_for(abs) else { continue };
-        let mut seen = HashSet::new();
-        offer_parent_chain(best, cx, req, flags, axis, tol, doc_x, doc_side, &overridden, ppi, &mut seen);
-    }
-}
-
-/// Walk `based_on`. A repeated spread id ends the walk.
-fn offer_parent_chain(
-    best: &mut Option<Best>,
-    cx: &ToolContext,
-    req: &SnapRequest<'_>,
-    flags: [bool; 3],
-    axis: Axis,
-    tol: f64,
-    doc_x: f64,
-    doc_side: PageSide,
-    overridden: &[ItemId],
-    index: usize,
-    seen: &mut HashSet<SpreadId>,
-) {
-    let Some(parent) = cx.doc.parents.get(index) else { return };
-    if !seen.insert(parent.id) {
-        return;
-    }
-    let next = parent.parent.as_ref().and_then(|info| info.based_on);
-    if let Some(page_idx) = shown_parent_page_index(parent.pages.len(), doc_side)
-        && let Some(parent_page) = parent.pages.get(page_idx)
-    {
-        let dx = doc_x - parent_page.x;
-        if dx.is_finite() {
+        for (ppi, ppage) in doc.shown_parent_pages(spread, pi) {
+            let Some(parent) = doc.parents.get(ppi) else { continue };
+            let Some(parent_page) = parent.pages.get(ppage) else { continue };
+            let dx = page.x - parent_page.x;
+            if !dx.is_finite() {
+                continue;
+            }
             for item in &parent.items {
-                if overridden.contains(&item.id) {
+                if page.overridden.contains(&item.id) {
                     continue;
                 }
-                // Same other-page skip as the renderer: a facing parent only shows items
-                // whose center sits on the parent page this document page uses.
-                if parent.pages.len() > 1 && parent.page_at_x(item.bounds().center().x) != Some(page_idx) {
+                // A facing parent only shows items whose center sits on the parent page this page uses.
+                if parent.pages.len() > 1 && parent.page_at_x(item.bounds().center().x) != Some(ppage) {
                     continue;
                 }
-                let Some(rect) = item_target_rect(cx.selection, req, item) else { continue };
-                offer_box(best, req.rect, flags, axis, shift_x(rect, dx), tol, cx.snap.align_edges, cx.snap.align_centers);
+                out.push((item.as_ref(), dx));
             }
         }
     }
-    let Some(next_id) = next else { return };
-    let Some(next_index) = cx.doc.parent_index(next_id) else { return };
-    offer_parent_chain(best, cx, req, flags, axis, tol, doc_x, doc_side, overridden, next_index, seen);
-}
-
-/// First page of a multi-page parent for a left-hand or single-sided page, otherwise the last page.
-/// Same choice as `Document::parent_page_for`.
-fn shown_parent_page_index(page_count: usize, side: PageSide) -> Option<usize> {
-    if page_count >= 2 && matches!(side, PageSide::Left | PageSide::Single) { Some(0) } else { page_count.checked_sub(1) }
+    out
 }
 
 fn shift_x(r: Rect, dx: f64) -> Rect {
@@ -1454,7 +1354,7 @@ mod tests {
 
     use designcraft_compose::Cache;
     use designcraft_doc::build::NewDocument;
-    use designcraft_doc::{Document, Guide, Item, Margins, Selection, Shape, Stroke};
+    use designcraft_doc::{Document, Guide, Item, Margins, PageSide, Selection, Shape, Stroke};
     use designcraft_geom::shapes;
     use designcraft_geom::{Affine, Unit};
 
@@ -1465,11 +1365,16 @@ mod tests {
     /// Snapping offers the parent page the canvas shows: a single-sided page uses a two-page parent's first page.
     #[test]
     fn shown_parent_page_matches_page_side() {
-        assert_eq!(shown_parent_page_index(2, PageSide::Single), Some(0));
-        assert_eq!(shown_parent_page_index(2, PageSide::Left), Some(0));
-        assert_eq!(shown_parent_page_index(2, PageSide::Right), Some(1));
-        assert_eq!(shown_parent_page_index(1, PageSide::Single), Some(0));
-        assert_eq!(shown_parent_page_index(0, PageSide::Single), None);
+        let two = Document::new(&NewDocument { facing_pages: true, ..Default::default() });
+        assert_eq!(two.parents[0].pages.len(), 2);
+        assert_eq!(two.parents[0].parent_page_for_side(PageSide::Single), Some(0));
+        assert_eq!(two.parents[0].parent_page_for_side(PageSide::Left), Some(0));
+        assert_eq!(two.parents[0].parent_page_for_side(PageSide::Right), Some(1));
+        let mut one = Document::new(&NewDocument { facing_pages: false, ..Default::default() });
+        assert_eq!(one.parents[0].pages.len(), 1);
+        assert_eq!(one.parents[0].parent_page_for_side(PageSide::Single), Some(0));
+        Arc::make_mut(&mut one.parents[0]).pages.clear();
+        assert_eq!(one.parents[0].parent_page_for_side(PageSide::Single), None);
     }
 
     // The factory flags are const. Pin them anyway.
@@ -1543,6 +1448,41 @@ mod tests {
             angle: None,
             radius: 0.0,
             pointer: Point::new(0.0, 0.0),
+        }
+    }
+
+    /// The bleed guide attracts like a ruler guide: a top edge 2 pt below the top bleed line
+    /// snaps up to it; with no bleed there is nothing there to snap to.
+    #[test]
+    fn bleed_guide_is_a_snap_target() {
+        let far = Rect::new(300.0, 300.0, 320.0, 320.0);
+        for (bleed, expected) in [([9.0, 9.0, 9.0, 9.0], -2.0), ([0.0; 4], 0.0)] {
+            let (mut doc, moving, _other) = doc_with_items(Rect::new(80.0, 100.0, 100.0, 140.0), far, 500.0);
+            doc.settings.bleed = bleed;
+            let top = doc.spreads[0].bounds().y0 - 9.0;
+            let rect = Rect::new(80.0, top + 2.0, 100.0, top + 40.0);
+            let cache = Cache::new();
+            let layout = CanvasLayout::new(&doc, false);
+            let sel = Selection::default();
+            let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+            cx.snap.zone_px = 4.0;
+            let hit = snap(
+                &cx,
+                SnapRequest {
+                    spread: SpreadRef::Doc(0),
+                    gesture: Gesture::Move,
+                    rect,
+                    x_edges: [false, false, false],
+                    y_edges: [true, true, true],
+                    exclude: &[moving],
+                    copying: false,
+                    lengths: [None, None],
+                    angle: None,
+                    radius: 0.0,
+                    pointer: Point::new(0.0, 0.0),
+                },
+            );
+            assert!((hit.delta.y - expected).abs() < 1e-6, "bleed {bleed:?}: {:?}", hit.delta);
         }
     }
 
@@ -1737,6 +1677,32 @@ mod tests {
     }
 
     #[test]
+    fn parent_page_guides_snap_on_the_document_page() {
+        // Facing document: page 1 is a right page at x = 0; its parent page is A's right page at
+        // x = 612 in the parent spread.
+        let mut doc = Document::new(&NewDocument::default());
+        let layer = doc.default_layer();
+        let id = ItemId(doc.alloc());
+        let item = Item::new(id, layer, Shape::Rectangle, shapes::rectangle(Rect::new(80.0, 100.0, 100.5, 140.0)));
+        doc.insert_item(SpreadRef::Doc(0), item, None).unwrap();
+        Arc::make_mut(&mut doc.parents[0]).pages[1].guides.push(Guide {
+            orientation: Orientation::Vertical,
+            position: 612.0 + 104.0,
+            spread: false,
+            locked: false,
+            layer: None,
+            liquid: false,
+        });
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+        cx.snap.zone_px = 4.0;
+        let hit = snap(&cx, move_req(Rect::new(80.0, 100.0, 100.5, 140.0), &[id]));
+        assert!((hit.delta.x - 3.5).abs() < 1e-6, "snaps to the parent guide at x = 104: {:?}", hit.delta);
+    }
+
+    #[test]
     fn grid_beats_a_closer_guide() {
         let mut doc = Document::new(&NewDocument::default());
         doc.settings.grid.horizontal = 72.0;
@@ -1914,6 +1880,109 @@ mod tests {
         );
         assert!((hit.delta.x - -2.0).abs() < 1e-6);
         assert!(hit.guides.iter().any(|g| matches!(g, Overlay::Gap { .. })));
+    }
+
+    fn doc_with_rects(rects: &[Rect]) -> Document {
+        let mut doc = Document::new(&NewDocument::default());
+        let layer = doc.default_layer();
+        for &r in rects {
+            let id = ItemId(doc.alloc());
+            let item = Item::new(id, layer, Shape::Rectangle, shapes::rectangle(r));
+            doc.insert_item(SpreadRef::Doc(0), item, None).unwrap();
+        }
+        doc
+    }
+
+    fn gap_overlays(guides: &[Overlay]) -> usize {
+        guides.iter().filter(|g| matches!(g, Overlay::Gap { .. })).count()
+    }
+
+    // #188: a box dragged between two others snaps to the middle and marks both gaps.
+    #[test]
+    fn move_centers_between_two_boxes_side_by_side() {
+        // Neighbours end at 40 and start at 160. The 30 wide mover at [83,113] is 2 left of centre.
+        let doc = doc_with_rects(&[Rect::new(0.0, 0.0, 40.0, 30.0), Rect::new(160.0, 0.0, 200.0, 30.0)]);
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+        cx.snap.snap_to_guides = false;
+        let hit = snap(&cx, move_req(Rect::new(83.0, 5.0, 113.0, 25.0), &[]));
+        assert!((hit.delta.x - 2.0).abs() < 1e-6, "{}", hit.delta.x);
+        assert_eq!(gap_overlays(&hit.guides), 2);
+    }
+
+    #[test]
+    fn move_centers_between_two_boxes_stacked() {
+        let doc = doc_with_rects(&[Rect::new(0.0, 0.0, 30.0, 40.0), Rect::new(0.0, 160.0, 30.0, 200.0)]);
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+        cx.snap.snap_to_guides = false;
+        let hit = snap(&cx, y_req(Rect::new(5.0, 83.0, 25.0, 113.0)));
+        assert!((hit.delta.y - 2.0).abs() < 1e-6, "{}", hit.delta.y);
+        assert_eq!(gap_overlays(&hit.guides), 2);
+    }
+
+    fn with_baseline_grid(mut doc: Document) -> Document {
+        doc.settings.baseline_grid.start = 36.0;
+        doc.settings.baseline_grid.increment = 12.0;
+        doc
+    }
+
+    // #188: with Snap to Guides on, the hidden baseline grid took vertical moves first.
+    #[test]
+    fn vertical_centering_beats_a_closer_baseline() {
+        // Middle at 200. Mover centre 198 (+2). Its top and bottom are 3 from lines 180 and 216.
+        let doc = with_baseline_grid(doc_with_rects(&[Rect::new(100.0, 100.0, 130.0, 140.0), Rect::new(100.0, 260.0, 130.0, 300.0)]));
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        let hit = snap(&cx, y_req(Rect::new(105.0, 183.0, 125.0, 213.0)));
+        assert!((hit.delta.y - 2.0).abs() < 1e-6, "{}", hit.delta.y);
+        assert_eq!(gap_overlays(&hit.guides), 2);
+    }
+
+    #[test]
+    fn vertical_alignment_beats_a_closer_baseline() {
+        // Top 107 is 1 from the line at 108 and 2 from the other box's top at 105.
+        let doc = with_baseline_grid(doc_with_rects(&[Rect::new(300.0, 105.0, 340.0, 135.0)]));
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        let hit = snap(&cx, y_req(Rect::new(100.0, 107.0, 140.0, 137.0)));
+        assert!((hit.delta.y - -2.0).abs() < 1e-6, "{}", hit.delta.y);
+        assert!(hit.guides.iter().any(|g| matches!(g, Overlay::Guide { .. })));
+    }
+
+    #[test]
+    fn move_off_center_outside_the_zone_does_not_center() {
+        // 10 off centre, zone 4.
+        let doc = doc_with_rects(&[Rect::new(0.0, 0.0, 40.0, 30.0), Rect::new(160.0, 0.0, 200.0, 30.0)]);
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+        cx.snap.snap_to_guides = false;
+        let hit = snap(&cx, move_req(Rect::new(95.0, 5.0, 125.0, 25.0), &[]));
+        assert_eq!(hit.delta.x, 0.0);
+        assert_eq!(gap_overlays(&hit.guides), 0);
+    }
+
+    #[test]
+    fn centering_needs_smart_spacing() {
+        let doc = doc_with_rects(&[Rect::new(0.0, 0.0, 40.0, 30.0), Rect::new(160.0, 0.0, 200.0, 30.0)]);
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let mut cx = ctx_on(&doc, &sel, &cache, &layout);
+        cx.snap.snap_to_guides = false;
+        cx.snap.smart_spacing = false;
+        let hit = snap(&cx, move_req(Rect::new(83.0, 5.0, 113.0, 25.0), &[]));
+        assert_eq!(hit.delta.x, 0.0);
     }
 
     #[test]

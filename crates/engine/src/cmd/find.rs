@@ -4,6 +4,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
+use designcraft_compose::grep::{Grep, GrepOptions, translate_replacement};
 use designcraft_doc::story::floor_char_boundary;
 use designcraft_doc::{Document, Selection, StoryId, TextSel};
 use serde_json::{Value, json};
@@ -21,7 +22,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if p.get("select").and_then(Value::as_bool).unwrap_or(true) && !ids.is_empty() {
                 let st = s.doc_mut()?;
                 st.selection = designcraft_doc::Selection::items(ids.clone());
-                st.revision += 1;
+                st.bump_revision();
             }
             Ok(json!({"ids": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
         }),
@@ -30,7 +31,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Change All (Object)",
             [],
             None,
-            "{…find.objects criteria, change: {fill?, stroke?, strokeWeight?, opacity?}} → {changed}",
+            "{…the criteria of find.objects, change: {fill?, stroke?, strokeWeight?, opacity?}} → {changed}",
             has_doc,
             |s, p| {
                 s.reset_find_scope();
@@ -60,7 +61,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!(query "find.find", "Find", ["Edit", "Find/Change"], None,
-            "{find, grep?: bool, caseSensitive?: bool, wholeWord?: bool, scope?: document|story|selection, story?} → matches [{story, start, end, text}]",
+            "{find, grep?: bool, caseSensitive?: bool, wholeWord?: bool, scope?: document|story|selection, story?, change?|first?|attrs?: ignored (find.change takes them; one request serves all three Find/Change commands)} → matches [{story, start, end, text}]",
             has_doc, find),
         cmd!(
             "find.change",
@@ -71,42 +72,23 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             change
         ),
-        cmd!(noundo "find.next", "Find Next", ["Edit"], Some("Cmd+Alt+F"), "{find, grep?, caseSensitive?, wholeWord?, scope?: document|story|selection, story?} — Selection starts at its original beginning; later calls advance within the scope", has_doc, find_next),
+        cmd!(noundo "find.next", "Find Next", ["Edit"], Some("Cmd+Alt+F"), "{find, grep?, caseSensitive?, wholeWord?, scope?: document|story|selection, story?, change?|first?|attrs?: ignored (find.change takes them; one request serves all three Find/Change commands)} — Selection starts at its original beginning; later calls advance within the scope", has_doc, find_next),
     ]
 }
 
-/// Translate InDesign text/GREP metacharacters to our story encoding.
-fn metachars(s: &str, grep: bool) -> String {
-    let pairs: &[(&str, &str)] = if grep {
-        &[
-            ("~b", "\n"),
-            ("\\r", "\n"),
-            ("~#", "\u{E000}"),
-            ("~x", "\u{E001}"),
-            ("~M", "\u{E002}"),
-            ("~R", "\u{E003}"),
-            ("~P", "\u{E004}"),
-            ("~L", "\u{E011}"),
-            ("~E", "\u{E012}"),
-            ("~=", "\u{2014}"),
-            ("~_", "\u{2014}"),
-            ("~-", "\u{AD}"),
-            ("~S", "\u{A0}"),
-            ("~n", "\u{2028}"),
-        ]
-    } else {
-        &[
-            ("^p", "\n"),
-            ("^t", "\t"),
-            ("^n", "\u{2028}"),
-            ("^#", "\u{E000}"),
-            ("^_", "\u{2014}"),
-            ("^=", "\u{2013}"),
-            ("^-", "\u{AD}"),
-            ("^s", "\u{A0}"),
-            ("^^", "^"),
-        ]
-    };
+/// Translate text-search metacharacters (`^p`, `^t`…) to our story encoding.
+fn metachars(s: &str) -> String {
+    let pairs: &[(&str, &str)] = &[
+        ("^p", "\n"),
+        ("^t", "\t"),
+        ("^n", "\u{2028}"),
+        ("^#", "\u{E000}"),
+        ("^_", "\u{2014}"),
+        ("^=", "\u{2013}"),
+        ("^-", "\u{AD}"),
+        ("^s", "\u{A0}"),
+        ("^^", "^"),
+    ];
     let mut out = s.to_string();
     for (a, b) in pairs {
         out = out.replace(a, b);
@@ -114,21 +96,16 @@ fn metachars(s: &str, grep: bool) -> String {
     out
 }
 
-fn build(p: &Value) -> Result<regex::Regex> {
+/// The search pattern: GREP (in the documents' dialect, see `designcraft_compose::grep`) or
+/// literal text with metacharacters.
+fn build(p: &Value) -> Result<Grep> {
     let f = str_param(p, "find").ok_or_else(|| bad("find", "missing `find`"))?;
     if f.is_empty() {
         return Err(bad("find", "empty search"));
     }
-    let grep = bool_or(p, "grep", false);
-    let mut pat = if grep { metachars(f, true) } else { regex::escape(&metachars(f, false)) };
-    if bool_or(p, "wholeWord", false) {
-        pat = format!(r"\b(?:{pat})\b");
-    }
-    regex::RegexBuilder::new(&pat)
-        .case_insensitive(!bool_or(p, "caseSensitive", false))
-        .multi_line(true)
-        .build()
-        .map_err(|e| bad("find", format!("bad GREP: {e}")))
+    let opts = GrepOptions { case_insensitive: !bool_or(p, "caseSensitive", false), multi_line: true, whole_word: bool_or(p, "wholeWord", false) };
+    let re = if bool_or(p, "grep", false) { Grep::new(f, opts) } else { Grep::literal(&metachars(f), opts) };
+    re.map_err(|e| bad("find", e))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +277,9 @@ fn scope(s: &Session, p: &Value) -> Result<FindContext> {
     Ok(context)
 }
 
+/// Most matches `find.find` returns.
+const MAX_MATCHES: usize = 10_000;
+
 fn find(s: &mut Session, p: &Value) -> Result<Value> {
     let re = build(p)?;
     let context = scope(s, p)?;
@@ -307,21 +287,18 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = Vec::new();
     for (sid, r) in &context.targets {
         let text = target_text(&st.doc, *sid, r)?;
-        for m in re.find_iter(text) {
-            out.push(json!({"story": sid.0, "start": r.start + m.start(), "end": r.start + m.end(), "text": m.as_str()}));
-            if out.len() >= 10_000 {
-                break;
-            }
+        for m in re.find_all(text, MAX_MATCHES.saturating_sub(out.len())).map_err(|e| bad("find", e))? {
+            out.push(json!({"story": sid.0, "start": r.start + m.start, "end": r.start + m.end, "text": text.get(m)}));
         }
     }
     s.find_context = Some(context);
     Ok(Value::Array(out))
 }
 
-/// Expand `$1`… (GREP) or text metacharacters in the change string.
+/// The change string: an expansion template (`$1`…) for GREP, else literal text.
 fn replacement(p: &Value) -> String {
     let c = str_param(p, "change").unwrap_or("");
-    metachars(c, bool_or(p, "grep", false))
+    if bool_or(p, "grep", false) { translate_replacement(c) } else { metachars(c) }
 }
 
 fn change(s: &mut Session, p: &Value) -> Result<Value> {
@@ -343,21 +320,16 @@ fn change(s: &mut Session, p: &Value) -> Result<Value> {
         for (sid, r) in targets {
             let Some(story) = d.story(sid) else { continue };
             // Collect matches first (positions refer to the original text), apply back to front.
-            let text = story.text.get(r.clone()).ok_or_else(|| bad("find", "invalid selection bounds or UTF-8 boundary"))?.to_string();
-            let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-            for caps in re.captures_iter(&text) {
-                let Some(m) = caps.get(0) else { continue };
-                let mut out = String::new();
-                if grep {
-                    caps.expand(&rep, &mut out);
-                } else {
-                    out = rep.clone();
-                }
-                edits.push((r.start + m.start()..r.start + m.end(), out));
-                if first_only {
-                    break;
-                }
+            let text = story.text.get(r.clone()).ok_or_else(|| bad("find", "invalid selection bounds or UTF-8 boundary"))?;
+            let edits: Vec<(std::ops::Range<usize>, String)> = if grep {
+                re.replacements(text, &rep, first_only)
+            } else {
+                re.find_all(text, if first_only { 1 } else { usize::MAX }).map(|ms| ms.into_iter().map(|m| (m, rep.clone())).collect())
             }
+            .map_err(|e| bad("find.change", e))?
+            .into_iter()
+            .map(|(m, out)| (r.start + m.start..r.start + m.end, out))
+            .collect();
             let Some(st) = d.story_mut(sid) else { continue };
             for (range, new) in edits.iter().rev() {
                 st.replace(range.clone(), new);
@@ -379,6 +351,7 @@ fn change(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 (t.anchor, t.focus) = if t.anchor <= t.focus { (start, end) } else { (end, start) };
             }
+            // `first` is the first match of the whole search, not of each story.
             if first_only && count > 0 {
                 break;
             }
@@ -398,18 +371,18 @@ fn find_next(s: &mut Session, p: &Value) -> Result<Value> {
         if text.get(from..).is_none() {
             return Err(bad("find", "invalid UTF-8 search cursor"));
         }
-        if let Some(m) = re.find_at(text, from) {
-            let (a, b) = (r.start + m.start(), r.start + m.end());
+        if let Some(m) = re.find_at(text, from).map_err(|e| bad("find.next", e))? {
+            let (a, b) = (r.start + m.start, r.start + m.end);
             // Match find_iter/captures_iter: suppress an empty match adjacent to the
             // previous match's end, but keep adjacent nonempty matches.
             if m.is_empty() && context.last_match_end == Some(b) {
-                context.advance_empty(text, m.end(), b);
+                context.advance_empty(text, m.end, b);
                 continue;
             }
             hit = Some((sid, a, b));
             context.last_match_end = Some(b);
             if m.is_empty() {
-                context.advance_empty(text, m.end(), b);
+                context.advance_empty(text, m.end, b);
             } else {
                 context.offset = b;
             }
@@ -424,7 +397,7 @@ fn find_next(s: &mut Session, p: &Value) -> Result<Value> {
     let frame = st.doc.story(sid).and_then(|x| x.frames.first().copied());
     let stm = s.doc_mut()?;
     stm.selection = Selection::text(TextSel { story: sid, anchor: a, focus: b, frame, cell: None });
-    stm.revision += 1;
+    stm.bump_revision();
     context.acknowledge(stm);
     s.find_context = Some(context);
     Ok(json!({"story": sid.0, "start": a, "end": b}))
@@ -459,6 +432,22 @@ mod tests {
         s.execute("find.next", &json!({"find": "or"})).unwrap();
         assert!(s.doc().unwrap().selection.text.is_some());
     }
+
+    #[test]
+    fn change_first_changes_one_match_in_the_whole_document() {
+        for grep in [false, true] {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            for y in [36, 336] {
+                s.execute("frame.create", &json!({"rect": [36, y, 300, y + 200], "content": "text", "text": "red and red"})).unwrap();
+            }
+            let r = s.execute("find.change", &json!({"find": "red", "change": "blue", "first": true, "grep": grep})).unwrap();
+            assert_eq!(r["count"], 1);
+            assert_eq!(s.execute("find.find", &json!({"find": "blue"})).unwrap().as_array().unwrap().len(), 1);
+            assert_eq!(s.execute("find.find", &json!({"find": "red"})).unwrap().as_array().unwrap().len(), 3);
+        }
+    }
+
     fn scope_session(text: &str) -> (Session, designcraft_doc::StoryId) {
         let mut s = Session::new();
         s.execute("file.new", &json!({})).unwrap();
@@ -576,6 +565,26 @@ mod tests {
                 json!([{"story": sid.0, "start": 2, "end": 6, "text": "🙂"}])
             );
         }
+    }
+
+    #[test]
+    fn grep_in_the_documents_dialect() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [36, 36, 300, 300], "content": "text", "text": "Москва and Paris, 1\u{2013}2 days.\nok"})).unwrap();
+        // `\u` uppercase, `\l` lowercase letter.
+        let m = s.execute("find.find", &json!({"find": r"\u\l+", "grep": true, "caseSensitive": true})).unwrap();
+        let words: Vec<&str> = m.as_array().unwrap().iter().map(|x| x["text"].as_str().unwrap()).collect();
+        assert_eq!(words, ["Москва", "Paris"]);
+        // `~=` en dash, `\h` space, `\r` paragraph end; the change uses groups, `~S` and `\r`.
+        let r = s.execute("find.change", &json!({"find": r"(\d)~=(\d)\h(\l+)\.\r", "change": r"$1~=$2~S$3!\r", "grep": true})).unwrap();
+        assert_eq!(r["count"], 1);
+        let sid = s.execute("document.inspect", &json!({})).unwrap()["stories"][0]["id"].as_u64().unwrap();
+        let text = s.execute("story.get", &json!({"story": sid})).unwrap()["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("Москва and Paris, 1\u{2013}2\u{A0}days!\nok"), "{text:?}");
+        // A pattern that doesn't compile is an error, not a silent no-op.
+        assert!(s.execute("find.find", &json!({"find": "[[:nope:]]", "grep": true})).is_err());
+        assert!(s.execute("find.change", &json!({"find": "(", "change": "", "grep": true})).is_err());
     }
 
     #[test]
@@ -837,7 +846,7 @@ mod tests {
         s.execute("text.selectWord", &json!({"frame": frame.0, "point": [point.x, point.y]})).unwrap();
         assert!(!s.text_drag, "explicit word reselection does not start a text drag");
         assert_eq!(s.doc().unwrap().selection, selected, "same full selection, including frame");
-        assert_eq!(s.doc().unwrap().revision, revision + 1);
+        assert!(s.doc().unwrap().revision > revision, "a new revision");
         assert!(std::sync::Arc::ptr_eq(&before, &s.doc().unwrap().doc));
         assert_eq!(s.doc().unwrap().history.undo.len(), history);
         assert!(s.find_context.is_none());
@@ -916,7 +925,7 @@ mod tests {
                 frame: None,
                 cell: None,
             });
-            st.revision += 1;
+            st.bump_revision();
             for command in ["find.find", "find.next", "find.change"] {
                 let before = s.doc().unwrap().doc.clone();
                 let err = s.execute(command, &json!({"find": "x", "change": "y", "scope": "selection"})).unwrap_err();
@@ -976,7 +985,7 @@ mod tests {
         // and would itself restore the template before selecting.
         let st = s.doc_mut().unwrap();
         st.selection = designcraft_doc::Selection::text(designcraft_doc::TextSel { story: sid, anchor: 0, focus: 7, frame: None, cell: None });
-        st.revision += 1;
+        st.bump_revision();
         let p = json!({"find": "red", "change": "blue", "scope": "selection"});
         assert_eq!(s.execute("find.find", &p).unwrap().as_array().unwrap().len(), 2);
         let history = s.doc().unwrap().history.undo.len();

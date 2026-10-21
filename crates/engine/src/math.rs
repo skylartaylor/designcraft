@@ -390,7 +390,7 @@ impl Parser<'_> {
             if self.peek().is_none() {
                 break;
             }
-            if self.s[self.i..].starts_with(&['\\', 'r', 'i', 'g', 'h', 't']) {
+            if self.s[self.i..].starts_with(&['\\', 'r', 'i', 'g', 'h', 't']) && !self.s.get(self.i + 6).is_some_and(|c| c.is_ascii_alphabetic()) {
                 self.i += 6;
                 break;
             }
@@ -720,6 +720,27 @@ mod tests {
         let Node::Group(v) = n else { panic!() };
         assert!(matches!(&v[0], Node::Fenced(o, _, c) if o == "(" && c == ")"));
         assert!(v.contains(&Node::Text("if ".into())));
+    }
+
+    /// A command that merely starts with "right" (`\rightarrow`) must not close a `\left` fence.
+    #[test]
+    fn right_prefixed_commands_do_not_close_a_fence() {
+        let n = parse(r"\left( x \rightarrow y \right)");
+        let Node::Group(v) = n else { panic!() };
+        assert_eq!(v.len(), 1, "{v:?}");
+        let Node::Fenced(o, body, c) = &v[0] else { panic!("{v:?}") };
+        assert!(o == "(" && c == ")", "{v:?}");
+        let Node::Group(b) = &**body else { panic!("{v:?}") };
+        assert_eq!(*b, vec![Node::Sym("x".into(), Class::Ident), Node::Sym("→".into(), Class::Rel), Node::Sym("y".into(), Class::Ident)]);
+        // An unknown `\right…` command stays inside the fence too.
+        let Node::Group(v) = parse(r"\left[ \rightfoo \right]") else { panic!() };
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Node::Fenced(o, _, c) if o == "[" && c == "]"), "{v:?}");
+        // Real closers still close it.
+        for (src, close) in [(r"\left( x \right)", ")"), (r"\left( x \right.", ""), (r"\left( x \right)y", ")")] {
+            let Node::Group(v) = parse(src) else { panic!() };
+            assert!(matches!(&v[0], Node::Fenced(_, _, c) if c == close), "{src}: {v:?}");
+        }
     }
 
     #[test]

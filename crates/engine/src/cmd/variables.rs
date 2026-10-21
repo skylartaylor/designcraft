@@ -48,21 +48,11 @@ pub fn specs() -> Vec<CommandSpec> {
                     let n = d.text_variables.len();
                     let ids: Vec<_> = d.stories.keys().copied().collect();
                     for sid in ids {
-                        let Some(st) = d.story(sid) else { continue };
-                        if !st.text.chars().any(|c| designcraft_doc::vars::var_index(c).is_some_and(|k| k >= i)) {
+                        if !d.story(sid).is_some_and(|st| needs_unvar(st, i, 0)) {
                             continue;
                         }
                         let st = d.story_mut(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
-                        let target = var_char(i).unwrap_or(' ').to_string();
-                        while let Some(pos) = st.text.find(&target) {
-                            st.replace(pos..pos + target.len(), &value);
-                        }
-                        for k in i + 1..n {
-                            let (from, to) = (var_char(k).unwrap_or(' ').to_string(), var_char(k - 1).unwrap_or(' ').to_string());
-                            while let Some(pos) = st.text.find(&from) {
-                                st.replace(pos..pos + from.len(), &to);
-                            }
-                        }
+                        unvar(st, i, n, &value, 0);
                     }
                     d.text_variables.remove(i);
                     Ok(Value::Null)
@@ -84,6 +74,63 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
     ]
+}
+
+/// Nesting limit for tables in cells and notes (hostile documents).
+const MAX_DEPTH: usize = 32;
+
+/// Whether `st` or a table cell or foot/endnote nested in it holds an instance of variable `i`
+/// or a later variable.
+fn needs_unvar(st: &designcraft_doc::Story, i: usize, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    st.text.chars().any(|c| designcraft_doc::vars::var_index(c).is_some_and(|k| k >= i))
+        || st.tables.values().any(|t| t.cells.iter().any(|c| needs_unvar(&c.text, i, depth + 1)))
+        || st.notes.iter().chain(st.endnotes.iter()).any(|n| needs_unvar(&n.text, i, depth + 1))
+}
+
+/// Replaces variable `i`'s instances in `st` with `value` and moves the instances of variables
+/// `i + 1..n` down by one, including table cells and foot/endnotes nested in the story. Only
+/// touches (and unshares) the parts that hold such instances; a story whose nested text changed
+/// gets a new revision.
+fn unvar(st: &mut designcraft_doc::Story, i: usize, n: usize, value: &str, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if st.text.chars().any(|c| designcraft_doc::vars::var_index(c).is_some_and(|k| k >= i)) {
+        let target = var_char(i).unwrap_or(' ').to_string();
+        while let Some(pos) = st.text.find(&target) {
+            st.replace(pos..pos + target.len(), value);
+        }
+        for k in i + 1..n {
+            let (from, to) = (var_char(k).unwrap_or(' ').to_string(), var_char(k - 1).unwrap_or(' ').to_string());
+            while let Some(pos) = st.text.find(&from) {
+                st.replace(pos..pos + from.len(), &to);
+            }
+        }
+    }
+    let mut nested = false;
+    for t in st.tables.values_mut() {
+        if !t.cells.iter().any(|c| needs_unvar(&c.text, i, depth + 1)) {
+            continue;
+        }
+        for c in &mut std::sync::Arc::make_mut(t).cells {
+            if needs_unvar(&c.text, i, depth + 1) {
+                unvar(&mut c.text, i, n, value, depth + 1);
+            }
+        }
+        nested = true;
+    }
+    for note in st.notes.iter_mut().chain(st.endnotes.iter_mut()) {
+        if needs_unvar(&note.text, i, depth + 1) {
+            unvar(&mut std::sync::Arc::make_mut(note).text, i, n, value, depth + 1);
+            nested = true;
+        }
+    }
+    if nested {
+        st.rev = st.rev.wrapping_add(1);
+    }
 }
 
 fn define(s: &mut Session, p: &Value) -> Result<Value> {
@@ -216,6 +263,52 @@ mod tests {
         assert_eq!(shown(0), 0, "no heading on or before the first page");
         assert_eq!(shown(2), "Epsilon".len(), "the third page (named 1) shows its own heading");
         assert_eq!(shown(3), "Epsilon".len(), "the fourth page (named 2) carries it");
+    }
+
+    /// Deleting a variable flattens its instances in table cells too and moves the instances of
+    /// later variables down, so cells keep showing the same text.
+    #[test]
+    fn delete_variable_reaches_table_cells() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("variables.define", &json!({"name": "A", "type": "custom", "text": "Alpha"})).unwrap();
+        let b = s.execute("variables.define", &json!({"name": "B", "type": "custom", "text": "Beta"})).unwrap()["index"].as_u64().unwrap() as usize;
+        let a = s.doc().unwrap().doc.variable("A").unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": ""})).unwrap();
+        let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+        s.execute("table.insert", &json!({"rows": 1, "cols": 2})).unwrap();
+        let text = format!("{}|{}", var_char(a).unwrap(), var_char(b).unwrap());
+        s.execute("table.setCell", &json!({"row": 0, "col": 0, "text": text})).unwrap();
+        s.execute("variables.delete", &json!({"name": "A"})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let t = d.story(sid).unwrap().tables.values().next().unwrap();
+        let nb = d.variable("B").unwrap();
+        assert_eq!(t.cells[0].text.text, format!("Alpha|{}", var_char(nb).unwrap()));
+    }
+
+    /// Deleting a variable flattens its instances in footnotes and endnotes too and moves the
+    /// instances of later variables down.
+    #[test]
+    fn delete_variable_reaches_notes() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("variables.define", &json!({"name": "A", "type": "custom", "text": "Alpha"})).unwrap();
+        let b = s.execute("variables.define", &json!({"name": "B", "type": "custom", "text": "Beta"})).unwrap()["index"].as_u64().unwrap() as usize;
+        let a = s.doc().unwrap().doc.variable("A").unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "x"})).unwrap();
+        let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        let text = format!("{}|{}", var_char(a).unwrap(), var_char(b).unwrap());
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 1, "focus": 1})).unwrap();
+        s.execute("footnote.insert", &json!({"text": text})).unwrap();
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 0})).unwrap();
+        s.execute("endnote.insert", &json!({"text": text})).unwrap();
+        s.execute("variables.delete", &json!({"name": "A"})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let st = d.story(sid).unwrap();
+        let want = format!("Alpha|{}", var_char(d.variable("B").unwrap()).unwrap());
+        assert_eq!(st.notes[0].text.text, want);
+        assert_eq!(st.endnotes[0].text.text, want);
     }
 
     #[test]

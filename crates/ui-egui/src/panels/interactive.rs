@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::DesignApp;
 use crate::theme::Tokens;
 
-fn dest_text(d: &Value) -> String {
+fn dest_text(lang: &str, d: &Value) -> String {
     if let Some(u) = d.get("url").and_then(Value::as_str) {
         return u.to_string();
     }
@@ -13,7 +13,7 @@ fn dest_text(d: &Value) -> String {
         return format!("mailto:{e}");
     }
     if let Some(p) = d.get("page").and_then(Value::as_u64) {
-        return format!("Page {}", p + 1);
+        return format!("{} {}", crate::i18n::tr(lang, "Page"), p + 1);
     }
     d.to_string()
 }
@@ -34,7 +34,7 @@ pub fn hyperlinks(app: &mut DesignApp, ui: &mut egui::Ui) {
         {
             let p = if let Some(m) = url.strip_prefix("mailto:") { json!({"email": m}) } else { json!({"url": url}) };
             if let Err(e) = app.run("hyperlink.create", p) {
-                app.status(format!("Hyperlinks: {e}"));
+                app.status_error("Hyperlinks", e);
             }
         }
     });
@@ -55,7 +55,7 @@ pub fn hyperlinks(app: &mut DesignApp, ui: &mut egui::Ui) {
     for h in list {
         let hid = h["id"].clone();
         ui.horizontal(|ui| {
-            let r = ui.selectable_label(false, h["name"].as_str().unwrap_or("")).on_hover_text(dest_text(&h["dest"]));
+            let r = ui.selectable_label(false, h["name"].as_str().unwrap_or("")).on_hover_text(dest_text(&app.ui.language, &h["dest"]));
             if r.clicked() {
                 let _ = app.run("hyperlink.goToSource", json!({"id": hid}));
             }
@@ -88,7 +88,10 @@ pub fn bookmarks(app: &mut DesignApp, ui: &mut egui::Ui) {
     for (i, b) in list.iter().enumerate() {
         let page = b["page"].as_u64().unwrap_or(0) as usize;
         ui.horizontal(|ui| {
-            if ui.selectable_label(false, b["name"].as_str().unwrap_or("")).on_hover_text(format!("Page {}", app.session.page_label(page))).clicked()
+            if ui
+                .selectable_label(false, b["name"].as_str().unwrap_or(""))
+                .on_hover_text(format!("{} {}", crate::i18n::tr(&app.ui.language, "Page"), app.session.page_label(page)))
+                .clicked()
             {
                 crate::canvas::go_to_page(app, page);
             }
@@ -176,7 +179,7 @@ pub fn tags(app: &mut DesignApp, ui: &mut egui::Ui) {
         if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New"))).clicked() && !name.trim().is_empty() {
             match app.run("xml.newTag", json!({"name": name.trim()})) {
                 Ok(_) => name.clear(),
-                Err(e) => app.status(format!("Tags: {e}")),
+                Err(e) => app.status_error("Tags", e),
             }
         }
     });
@@ -232,7 +235,7 @@ pub fn tags(app: &mut DesignApp, ui: &mut egui::Ui) {
         {
             match app.run("xml.loadDtd", json!({"path": path})) {
                 Ok(_) => problems = None,
-                Err(e) => app.status(format!("Load DTD: {e}")),
+                Err(e) => app.status_error("Load DTD", e),
             }
         }
         let has_dtd = info["dtd"].as_bool().unwrap_or(false);
@@ -281,7 +284,7 @@ pub fn tags(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_open.as_mut().and_then(|f| f("xml"))
             && let Err(e) = app.run("file.importXml", json!({"path": path}))
         {
-            app.status(format!("Import XML: {e}"));
+            app.status_error("Import XML", e);
         }
     });
 }
@@ -310,7 +313,7 @@ pub fn states(app: &mut DesignApp, ui: &mut egui::Ui) {
             .clicked()
             && let Err(e) = app.run("states.create", json!({}))
         {
-            app.status(format!("Object States: {e}"));
+            app.status_error("Object States", e);
         }
         return;
     }
@@ -398,7 +401,7 @@ pub fn buttons(app: &mut DesignApp, ui: &mut egui::Ui) {
     if let Some(p) = params
         && let Err(e) = app.run("button.set", p)
     {
-        app.status(format!("Buttons: {e}"));
+        app.status_error("Buttons", e);
     }
     crate::rtl::label(
         ui,
@@ -636,7 +639,7 @@ pub fn media(app: &mut DesignApp, ui: &mut egui::Ui) {
             && let Some(path) = app.services.pick_open.as_mut().and_then(|f| f("place"))
             && let Err(e) = app.run("media.options", json!({"poster": {"path": path}}))
         {
-            app.status(format!("Media: {e}"));
+            app.status_error("Media", e);
         }
         if !m["poster"].is_null() && ui.small_button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "None"))).clicked() {
             let _ = app.run("media.options", json!({"poster": null}));

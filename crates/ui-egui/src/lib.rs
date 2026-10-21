@@ -14,18 +14,23 @@ pub mod credits;
 pub mod cursors;
 pub mod dialogs;
 pub mod dock;
+pub mod effects_dialog;
 pub mod i18n;
 pub mod icons;
 pub mod menus;
 mod modal_drag;
+mod new_document;
+mod object_control;
 mod panel_docking;
 pub mod panels;
 mod prefs;
 pub mod render_worker;
 mod rtl;
+mod section_options;
 pub mod story_editor;
 pub mod taskbar;
 pub mod theme;
+pub mod title_bar;
 pub mod toolbar;
 pub mod widgets;
 
@@ -54,7 +59,8 @@ pub struct ImportedFile {
     pub bytes: Vec<u8>,
 }
 pub type OpenAsyncFn = Box<dyn FnMut(ImportRequest)>;
-pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
+/// Starts a browser download; an error means no file was handed to the user.
+pub type DownloadFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 pub type ClipboardFn = Box<dyn FnMut() -> Option<String>>;
 /// Files delivered asynchronously with their original operation and document identity.
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<ImportedFile>>>;
@@ -113,6 +119,13 @@ pub struct SavedWorkspace {
     /// The workspace's own icon column (see [`UiState::icon_groups`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_groups: Option<Vec<Vec<String>>>,
+    /// Saved with New Workspace › Capture › Panel Locations off: choosing the workspace leaves the
+    /// bars and panels where they are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_panels: bool,
+    /// New Workspace › Capture › Menu Customization: the menu items hidden with Edit › Menus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_menu_items: Option<Vec<String>>,
 }
 
 /// A missing on-by-default bool stays on. `bool::default` is false.
@@ -174,6 +187,11 @@ impl Default for PdfExportSettings {
 pub struct UiState {
     pub brightness: theme::Brightness,
     pub screen_mode: ScreenMode,
+    /// The screen mode leaving Presentation returns to: the one it was entered from.
+    pub presentation_return: ScreenMode,
+    /// The view (by its `views` key) Presentation was entered from; leaving puts it back.
+    #[serde(skip)]
+    pub presentation_view: Option<(u64, View)>,
     pub frame_edges: bool,
     pub rulers: bool,
     pub guides: bool,
@@ -195,6 +213,13 @@ pub struct UiState {
     pub flattener_preview: bool,
     /// Tab / Shift+Tab: 1 = every panel hidden, 2 = all but the Tools panel (0 = shown).
     pub hidden_panels: u8,
+    /// "Don't show again" in the warning before deleting pages that contain objects.
+    pub skip_delete_pages_warning: bool,
+    /// The Pages panel's parents part as its divider was last dragged, and the height the two
+    /// parts shared then (None: a few rows).
+    pub pages_parents_height: Option<[f32; 2]>,
+    /// The Pages panel's Panel Options.
+    pub pages_panel: panels::pages::PanelOptions,
     /// Edit › Color Settings (re-applied at start).
     pub color_settings: Option<designcraft_color::cms::ColorSettings>,
     /// View › Proof Colors and View › Proof Setup.
@@ -204,7 +229,7 @@ pub struct UiState {
     pub dynamic_spelling: bool,
     /// Preferences › Story Editor Display: text size (points).
     pub story_editor_size: f32,
-    /// Edit › Interface Language: supported codes are listed in `i18n::LANGUAGES`.
+    /// Preferences › General › Interface Language: supported codes are listed in `i18n::LANGUAGES`.
     pub language: String,
     /// Edit › Transparency Flattener Presets: "" (none), "high", "medium" or "low" for PDF export.
     pub flattener: String,
@@ -257,6 +282,14 @@ pub struct UiState {
     pub workspace: String,
     /// Window › Workspace › New Workspace: saved panel arrangements.
     pub custom_workspaces: Vec<SavedWorkspace>,
+    /// File › New › Document › Recent: the settings of the last documents made, newest first.
+    pub recent_new_documents: Vec<designcraft_doc::build::NewDocument>,
+    /// The font menus' sample text (a key of `panels::FONT_SAMPLES`) and size (0–2).
+    pub font_sample: String,
+    pub font_preview_size: u8,
+    /// File › New › Document › Preview, kept for the session.
+    #[serde(skip)]
+    pub new_document_preview: bool,
     /// Transform reference point (0..8, row-major; 0 = top-left).
     pub ref_point: u8,
     /// Align To target (`selection`, `keyObject`, `margins`, `page`, `spread`).
@@ -304,6 +337,9 @@ pub struct UiState {
     pub palette: Option<String>,
     #[serde(skip)]
     pub flyout: Option<usize>,
+    /// Type › Tabs: the selected stop and where the panel sits.
+    #[serde(skip)]
+    pub tabs_panel: panels::tabs::PanelState,
     /// The colour and gradient swatches applied last: what Apply Color (,) and Apply Gradient (.)
     /// apply again.
     #[serde(skip)]
@@ -321,6 +357,8 @@ impl Default for UiState {
         UiState {
             brightness: theme::Brightness::MediumDark,
             screen_mode: ScreenMode::Normal,
+            presentation_return: ScreenMode::Normal,
+            presentation_view: None,
             frame_edges: true,
             rulers: true,
             guides: true,
@@ -339,6 +377,9 @@ impl Default for UiState {
             tag_markers: false,
             flattener_preview: false,
             hidden_panels: 0,
+            skip_delete_pages_warning: false,
+            pages_parents_height: None,
+            pages_panel: Default::default(),
             color_settings: None,
             proof_colors: false,
             proof_setup: Default::default(),
@@ -368,6 +409,10 @@ impl Default for UiState {
             units: Unit::Picas,
             workspace: "Essentials".into(),
             custom_workspaces: Vec::new(),
+            recent_new_documents: Vec::new(),
+            font_sample: "selected".into(),
+            font_preview_size: 1,
+            new_document_preview: false,
             ref_point: 0,
             align_to: "selection".into(),
             text_style_tab: 0,
@@ -391,6 +436,7 @@ impl Default for UiState {
             dialog: None,
             palette: None,
             flyout: None,
+            tabs_panel: Default::default(),
             last_color: None,
             last_gradient: None,
             stroke_front: false,
@@ -461,6 +507,7 @@ impl CanvasCache {
             last_ms: 0.0,
             shown_doc: None,
             pending_doc: None,
+            display_key: None,
             patcher: designcraft_render::Renderer::new(),
             patches: 0,
         }
@@ -488,6 +535,8 @@ pub struct CanvasCache {
     pub shown_doc: Option<std::sync::Arc<designcraft_doc::Document>>,
     /// Document of the request in flight.
     pub pending_doc: Option<std::sync::Arc<designcraft_doc::Document>>,
+    /// Display options the texture and the request in flight were rendered with.
+    pub display_key: Option<canvas::DisplayKey>,
     /// Renders damaged regions (its own context: region sizes vary).
     pub patcher: designcraft_render::Renderer,
     /// Partial repaints / full renders since start (perf readout).
@@ -530,7 +579,7 @@ pub struct DesignApp {
     control_input_frame: std::sync::Arc<std::sync::atomic::AtomicBool>,
     clipboard_guard_installed: bool,
     /// Story open in the Story Editor.
-    pub story_editor: Option<designcraft_doc::StoryId>,
+    pub story_editor: Option<story_editor::Target>,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<(u64, Option<String>, Sender<ControlResponse>, f64)>,
     queued_shots: Vec<(u64, f64, u32)>,
@@ -543,7 +592,14 @@ pub struct DesignApp {
     fonts_system: bool,
     pub restyle: bool,
     fonts_ready: bool,
+    /// Files the operating system asked to open (macOS Finder, Dock, Open With), opened once the
+    /// window is ready; see [`DesignApp::open_documents_later`].
+    os_documents: Vec<String>,
     pub integrated_titlebar: bool,
+    /// The desktop host uses our caption controls and window drag/resize regions (Windows).
+    pub custom_titlebar: bool,
+    pub(crate) window_maximized: bool,
+    pub(crate) pending_window_commands: Vec<egui::ViewportCommand>,
     /// The host installed a native menu bar (macOS): don't draw menus in the window.
     pub native_menu: bool,
     /// Shortcuts the native menu handles (skip them in the egui shortcut handler).
@@ -560,6 +616,14 @@ pub struct DesignApp {
     /// (no native menu: without it the paste keys produce no paste event), or what it held then
     /// (native menu). It is never pasted as text: Paste with it pastes the copied objects.
     object_clip_text: Option<String>,
+    /// The marked text the system IME last sent (`None` once it commits or clears). When the
+    /// composition ends some other way (a click, a tool switch), the IME is told to drop it.
+    pub(crate) ime_marked: Option<String>,
+    /// The system IME must drop its marked text (see [`Self::take_ime_discard`]).
+    pub(crate) ime_discard: bool,
+    /// The canvas asked for the system IME in the last frame (the web build's text input has the
+    /// keyboard then).
+    pub(crate) canvas_ime: bool,
     /// Quit was chosen: close the window on the next frame, as its close button does.
     quit_requested: bool,
     /// Close the window without asking about unsaved changes (the control channel's `app.quit`).
@@ -568,6 +632,15 @@ pub struct DesignApp {
     quitting: Option<QuitState>,
     /// The tool cursor bitmaps handed to the OS.
     pub cursors: cursors::Images,
+    /// A panel's live preview (a slider being dragged), committed when it is let go.
+    live_preview: LivePreview,
+}
+
+/// The preview a panel opened with `edit.preview`: it stays open while a panel holds it each frame.
+#[derive(Default)]
+struct LivePreview {
+    open: bool,
+    held: bool,
 }
 
 struct QuitState {
@@ -610,7 +683,11 @@ impl DesignApp {
             fonts_system: false,
             restyle: false,
             fonts_ready: false,
+            os_documents: Vec::new(),
             integrated_titlebar: false,
+            custom_titlebar: false,
+            window_maximized: false,
+            pending_window_commands: vec![],
             native_menu: false,
             native_shortcuts: Default::default(),
             last_time: 0.0,
@@ -618,10 +695,14 @@ impl DesignApp {
             egui_ctx: None,
             in_control: false,
             object_clip_text: None,
+            ime_marked: None,
+            ime_discard: false,
+            canvas_ime: false,
             quit_requested: false,
             quit_without_asking: false,
             quitting: None,
             cursors: cursors::Images::default(),
+            live_preview: LivePreview::default(),
         }
     }
 
@@ -656,13 +737,36 @@ impl DesignApp {
         ViewInfo {
             zoom: self.view().map(|v| v.zoom).unwrap_or(1.0),
             snap: self.ui.snap_view(),
-            unit: self.ui.units,
+            // Tool readouts (sizes, smart-guide distances) measure in the document's ruler units,
+            // as its Control and Properties fields do.
+            unit: self.session.active().map_or(self.ui.units, |st| st.doc.settings.horizontal_units),
             stroke_in_front: self.ui.stroke_front,
         }
     }
 
     pub fn status(&mut self, s: impl Into<String>) {
         self.ui.status = s.into();
+    }
+
+    /// Did an IME composition end outside the IME this frame (a click, a tool switch)? egui's
+    /// `should_interrupt_composition` toggles winit's IME, which doesn't reach the macOS input
+    /// context: it keeps the marked text and types it again into the next composition, so the
+    /// host discards it there.
+    pub fn take_ime_discard(&mut self) -> bool {
+        std::mem::take(&mut self.ime_discard)
+    }
+
+    /// Did the canvas ask for the system IME in the last frame (a Type tool caret)? The web
+    /// build's hidden text input has the keyboard then, so text events hold what the browser
+    /// typed (see [`drop_key_name_text`]).
+    pub fn canvas_ime(&self) -> bool {
+        self.canvas_ime
+    }
+
+    /// "<feature>: <error>" in the status bar: the feature name is translated, the engine's own
+    /// error text stays as the engine wrote it.
+    pub fn status_error(&mut self, feature: &str, error: impl std::fmt::Display) {
+        self.ui.status = format!("{}: {error}", crate::i18n::tr(&self.ui.language, feature));
     }
 
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
@@ -672,7 +776,26 @@ impl DesignApp {
         }
         // Only user-initiated runs touch the system clipboard, never the control channel's.
         let system_clipboard = !self.in_control && !self.control_input_frame.load(std::sync::atomic::Ordering::Relaxed);
-        let params = if system_clipboard { self.with_system_clipboard(id, params) } else { params };
+        let mut params = if system_clipboard { self.with_system_clipboard(id, params) } else { params };
+        // Vector art copied in another app (Illustrator, VectorCraft, Figma) is SVG markup on the
+        // system clipboard: with no insertion point it pastes as editable paths where text would go.
+        let typing = self.session.active().is_some_and(|d| d.selection.text.is_some());
+        let id = match params.as_object_mut() {
+            Some(o) if id == "edit.paste" && !typing && o.get("text").and_then(Value::as_str).is_some_and(designcraft_engine::cmd::is_svg_markup) => {
+                if let Some(svg) = o.remove("text") {
+                    o.insert("svg".into(), svg);
+                }
+                "edit.pasteSvg"
+            }
+            _ => id,
+        };
+        // Copied objects paste on the spread in view.
+        if matches!(id, "edit.paste" | "edit.pasteInPlace" | "edit.pasteSvg")
+            && let Some(spread) = canvas::current_spread(self)
+            && let Some(p) = params.as_object_mut()
+        {
+            p.entry("spread").or_insert(json!(spread));
+        }
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.after_engine();
         match &r {
@@ -700,7 +823,55 @@ impl DesignApp {
             }
             Ok(_) => {}
         }
+        if r.is_ok() && matches!(id, "file.open" | "file.openIdml" | "file.openBytes") {
+            if self.ui.dialog.as_ref().is_some_and(|d| d.id == "findFont") {
+                self.ui.dialog = None;
+            }
+            match self.session.execute("font.list", &json!({})) {
+                Ok(fonts) if fonts.as_array().is_some_and(|fonts| fonts.iter().any(|f| f["missing"] == true || f["styleMissing"] == true)) => {
+                    self.ui.dialog = Some(dialogs::Dialog::new("findFont", json!({"_fonts": fonts, "onOpen": true})));
+                }
+                Err(e) => self.status(e.to_string()),
+                _ => {}
+            }
+        }
+        if r.is_ok()
+            && matches!(id, "font.replace" | "font.reload" | "edit.undo" | "edit.redo")
+            && let Some(dialog) = self.ui.dialog.as_mut().filter(|d| d.id == "findFont")
+        {
+            dialog.fields.remove("_fonts");
+        }
         r
+    }
+
+    /// Show `command` on the page as a live preview named `label` (the undo step's name): each call
+    /// replaces the last, and nothing reaches the undo history until [`Self::end_live_preview`]. A
+    /// panel calls this, or [`Self::hold_live_preview`], every frame its control is held; a frame
+    /// without either commits the preview.
+    pub fn live_preview(&mut self, label: &str, command: &str, params: Value) {
+        if self.run("edit.preview", json!({"label": label, "command": command, "params": params})).is_ok() {
+            self.live_preview = LivePreview { open: true, held: true };
+        }
+    }
+
+    /// The control showing the live preview is still held (pressed, though not moved this frame).
+    pub fn hold_live_preview(&mut self) {
+        self.live_preview.held = self.live_preview.open;
+    }
+
+    /// Commit the live preview, if one is open, as one undo step.
+    pub fn end_live_preview(&mut self) {
+        if std::mem::take(&mut self.live_preview).open {
+            let _ = self.run("edit.commitPreview", json!({}));
+        }
+    }
+
+    /// Start of a frame: a live preview no panel held last frame (its control was let go, or the
+    /// panel closed) is committed, so it never swallows later edits' undo steps.
+    pub(crate) fn settle_live_preview(&mut self) {
+        if !std::mem::take(&mut self.live_preview.held) {
+            self.end_live_preview();
+        }
     }
 
     /// Paste without the clipboard's text (a menu, not the paste keys): read it here. With no
@@ -772,6 +943,7 @@ impl DesignApp {
         for r in reqs {
             let was_find = self.ui.dialog.as_ref().is_some_and(|d| d.id == "findChange");
             match r {
+                UiRequest::Dialog { id, params } if id == "colorTheme" => dialogs::open_color_theme(self, params),
                 UiRequest::Dialog { id, params } => self.ui.dialog = Some(dialogs::Dialog::new(&id, params)),
                 UiRequest::View { params } => canvas::apply_view_request(self, &params),
                 UiRequest::Pick { purpose, params } => {
@@ -780,7 +952,7 @@ impl DesignApp {
                 }
             }
             // Release only when the request actually replaces Find, including a native PDF picker.
-            if was_find && !self.ui.dialog.as_ref().is_some_and(|d| d.id == "findChange") {
+            if was_find && self.ui.dialog.as_ref().is_none_or(|d| d.id != "findChange") {
                 self.session.reset_find_scope();
             }
         }
@@ -821,6 +993,28 @@ impl DesignApp {
         Ok(Value::Null)
     }
 
+    /// Load Styles: ask the host for a document whose styles to load; `kind` is `paragraph`,
+    /// `character` or empty for both. A synchronous picker opens the dialog that chooses among
+    /// the file's styles; an asynchronous one (web) loads them all when the file arrives.
+    pub fn pick_styles(&mut self, kind: &str) -> Result<Value, String> {
+        designcraft_engine::cmd::has_doc(&self.session)?;
+        if let Some(pick) = self.services.pick_open.as_mut() {
+            let Some(path) = pick("styles") else { return Ok(Value::Null) };
+            let found = self.run("style.load.list", json!({"path": path}))?;
+            let of = |k: &str| if kind.is_empty() || kind == k { found[k].clone() } else { json!([]) };
+            self.ui.dialog = Some(dialogs::Dialog::new(
+                "loadStyles",
+                json!({"path": path, "paragraph": of("paragraph"), "character": of("character"), "conflicts": "redefine"}),
+            ));
+            return Ok(Value::Null);
+        }
+        let request = self.import_request(&if kind.is_empty() { "styles".to_string() } else { format!("styles:{kind}") });
+        if let Some(open) = self.services.open_async.as_mut() {
+            open(request);
+        }
+        Ok(Value::Null)
+    }
+
     pub fn import_request(&self, purpose: &str) -> ImportRequest {
         ImportRequest { purpose: purpose.into(), target: self.session.active().map(|d| d.uid) }
     }
@@ -828,7 +1022,7 @@ impl DesignApp {
     pub(crate) fn activate_import_target(&mut self, request: &ImportRequest) -> Result<(), String> {
         let Some(index) = request.target.and_then(|uid| self.session.documents().iter().position(|d| d.uid == uid)) else {
             let message = "Import cancelled: the originating document has closed";
-            self.status(message);
+            self.status(crate::i18n::tr(&self.ui.language, message));
             return Err(message.into());
         };
         self.run("file.activate", json!({"index": index}))?;
@@ -859,7 +1053,7 @@ impl DesignApp {
                     if owns_dialog {
                         self.ui.dialog = None;
                     }
-                    self.status("PDF import cancelled: the originating document has closed");
+                    self.status(crate::i18n::tr(&self.ui.language, "PDF import cancelled: the originating document has closed"));
                 }
             }
         }
@@ -867,7 +1061,10 @@ impl DesignApp {
         let files = std::mem::take(&mut *inbox.lock().unwrap_or_else(|e| e.into_inner()));
         for file in files {
             if self.ui.dialog.is_some() {
-                self.status(format!("{}: import cancelled while a dialog is open; choose the file again", file.name));
+                self.status(
+                    crate::i18n::tr(&self.ui.language, "{name}: import cancelled while a dialog is open; choose the file again")
+                        .replace("{name}", &file.name),
+                );
                 continue;
             }
             let name = file.name.clone();
@@ -879,7 +1076,18 @@ impl DesignApp {
 
     fn import_file(&mut self, file: ImportedFile) -> Result<Value, String> {
         let lower = file.name.to_ascii_lowercase();
-        let layout = opens_as_document(&file.name);
+        if let Some(kind) = file.request.purpose.strip_prefix("styles") {
+            self.activate_import_target(&file.request)?;
+            let mut params = json!({"name": file.name, "base64": designcraft_engine::cmd::base64_encode(&file.bytes)});
+            match kind {
+                ":paragraph" => params["character"] = json!([]),
+                ":character" => params["paragraph"] = json!([]),
+                _ => {}
+            }
+            return self.run("style.load", params);
+        }
+        let layout = opens_as_document(&file.name)
+            || (std::path::Path::new(&file.name).extension().is_none() && designcraft_engine::cmd::is_document(&file.bytes));
         let place =
             file.request.purpose == "place" || (matches!(file.request.purpose.as_str(), "drop" | "open") && !layout && !lower.ends_with(".ase"));
         if place || lower.ends_with(".ase") || file.request.purpose == "swatches" {
@@ -917,10 +1125,11 @@ impl DesignApp {
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
+        self.window_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         if !self.color_applied {
             self.color_applied = true;
             if let Some(cs) = self.ui.color_settings.clone() {
-                let _ = designcraft_color::cms::set_active(&cs);
+                let _ = designcraft_color::cms::set_active(&cs.with_known_profiles());
             }
         }
         let scale = self.ui.ui_scale.clamp(0.5, 3.0);
@@ -958,7 +1167,7 @@ impl DesignApp {
             if self.session.documents().iter().any(|d| d.is_dirty())
                 && let Err(e) = self.session.execute("file.recovery.save", &json!({}))
             {
-                self.status(format!("Couldn't write recovery data: {e}"));
+                self.status(crate::i18n::tr(&self.ui.language, "Couldn't write recovery data: {error}").replace("{error}", &e.to_string()));
             }
         }
         let dt = now - self.last_time;
@@ -967,8 +1176,10 @@ impl DesignApp {
         }
         self.last_time = now;
         self.drain_control(ctx);
+        new_document::end_stale_preview(self);
         if self.fonts_ready {
             self.drain_inbox();
+            self.open_os_documents();
         }
         if !self.synthetic.is_empty() || !self.control_synthetic.is_empty() {
             ctx.request_repaint();
@@ -978,6 +1189,7 @@ impl DesignApp {
         if self.fonts_ready {
             menus::shortcuts(self, ctx);
         }
+        self.flush_window_commands(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (dropped, pointer) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.hover_pos()));
@@ -1137,18 +1349,23 @@ impl DesignApp {
 
     /// A file dropped on the window: documents open, the swatches in a swatch exchange (.ase) file
     /// are loaded, and anything else is placed on the spread in view (a parent spread while parents
-    /// are being edited).
+    /// are being edited). A file without an extension opens when its content is a DesignCraft or
+    /// IDML document.
     pub fn open_dropped(&mut self, path: &str) -> Result<Value, String> {
         self.open_dropped_at(path, None)
     }
 
     /// [`Self::open_dropped`] at the pointer: a graphic's top left lands where the file was
-    /// dropped on the canvas, text goes to a new frame on the page there.
+    /// dropped on the canvas, text goes to a new frame on the document page there.
     pub fn open_dropped_at(&mut self, path: &str, pointer: Option<egui::Pos2>) -> Result<Value, String> {
         if path.to_ascii_lowercase().ends_with(".ase") {
             return self.run("swatch.load", json!({"path": path}));
         }
-        if opens_as_document(path) {
+        let document = opens_as_document(path)
+            || (std::path::Path::new(path).extension().is_none()
+                && designcraft_engine::io::read_capped(path, designcraft_engine::cmd::DOCUMENT_SNIFF_BYTES)
+                    .is_ok_and(|b| designcraft_engine::cmd::is_document(&b)));
+        if document {
             return self.open_file("file.open", json!({"path": path}));
         }
         let mut params = json!({"path": path});
@@ -1162,6 +1379,21 @@ impl DesignApp {
             }
         }
         self.open_file("file.place", params)
+    }
+
+    /// Queue files the operating system asked the app to open. They can arrive before the window
+    /// exists (the event that launched the app); the first ready frame opens them, each as a new
+    /// document through `file.open`, as File › Open does.
+    pub fn open_documents_later(&mut self, paths: impl IntoIterator<Item = String>) {
+        self.os_documents.extend(paths);
+    }
+
+    fn open_os_documents(&mut self) {
+        for path in std::mem::take(&mut self.os_documents) {
+            if let Err(e) = self.open_file("file.open", json!({"path": path})) {
+                log::warn!("{path}: {e}");
+            }
+        }
     }
 
     /// File › Place: the file fills the selected empty or graphic frame; with none, an image loads
@@ -1181,6 +1413,12 @@ impl DesignApp {
             Some(path) => std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string()),
             None => params.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
         };
+        self.open_named_file(cmd, params, file)
+    }
+
+    /// [`Self::open_file`] for a command whose params don't name the file: `file` is shown in the
+    /// alert or warnings.
+    pub fn open_named_file(&mut self, cmd: &str, params: Value, file: String) -> Result<Value, String> {
         let r = self.run(cmd, params);
         if let Err(e) = &r {
             let title = if cmd == "file.place" { "Can't Place the File" } else { "Can't Open the File" };
@@ -1199,11 +1437,22 @@ impl DesignApp {
                 .collect();
             if !warnings.is_empty() {
                 self.status(format!("{file}: {}", warnings.join("; ")));
-                self.ui.dialog =
-                    Some(dialogs::Dialog::new("alert", json!({"title": "Import Warnings", "file": file, "message": warnings.join("\n")})));
+                // Find Font, offered for the document's missing fonts, stays up: the status line
+                // keeps the warnings.
+                if self.ui.dialog.as_ref().is_none_or(|d| d.id != "findFont") {
+                    self.ui.dialog =
+                        Some(dialogs::Dialog::new("alert", json!({"title": "Import Warnings", "file": file, "message": warnings.join("\n")})));
+                }
             }
         }
         r
+    }
+
+    /// Deliver window actions to the host without persisting them in UI preferences.
+    pub(crate) fn flush_window_commands(&mut self, ctx: &egui::Context) {
+        for command in std::mem::take(&mut self.pending_window_commands) {
+            ctx.send_viewport_cmd(command);
+        }
     }
 
     /// Keep widget clipboard output private while a queued control event is running.
@@ -1244,16 +1493,19 @@ impl DesignApp {
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.canvas_ime = false;
         if !self.fonts_ready {
             ctx.request_repaint();
             return;
         }
+        self.settle_live_preview();
         let t0 = now_ms();
         let t = theme::Tokens::get(&ctx);
         let presenting = self.ui.screen_mode == ScreenMode::Presentation;
         if presenting || self.ui.hidden_panels != 0 {
             panel_docking::cancel_gesture(self, &ctx);
         }
+        canvas::begin_frame(&ctx);
         let dbg = std::env::var_os("DESIGNCRAFT_DEBUG_LAYOUT").is_some();
         if dbg {
             eprintln!("root start {:?}", ui.available_rect_before_wrap());
@@ -1366,12 +1618,18 @@ impl DesignApp {
             );
             self.switch_pane(self.focus_pane);
         }
-        dock::flyout(self, &ctx);
-        dock::floating(self, &ctx);
+        // Tab, Shift+Tab and Presentation hide the floating panels with the docked ones.
+        if !presenting && self.ui.hidden_panels == 0 {
+            dock::flyout(self, &ctx);
+            dock::floating(self, &ctx);
+        }
         story_editor::show(self, &ctx);
         dialogs::show(self, &ctx);
         about::show(self, &ctx);
         menus::palette(self, &ctx);
+        if self.custom_titlebar {
+            chrome::resize_borders(self, ui);
+        }
         for url in std::mem::take(&mut self.ui.pending_urls) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -1447,12 +1705,22 @@ impl DesignApp {
     }
 }
 
-/// Files that open as documents (when dropped or picked) rather than being placed: DesignCraft
-/// and IDML.
+/// Whether CJK-only interface is shown (Preferences › Type › Show CJK Features): the explicit
+/// preference, else on for a Japanese, Chinese or Korean interface language.
+///
+/// Every menu item, dialog section and panel field that only CJK typesetting uses goes behind
+/// this check, as in InDesign, whose Roman edition leaves those features out. It hides interface
+/// only: the commands behind it run whatever it says (from scripts, the control channel and MCP).
+/// Story Direction, the vertical type tools, frame grids, Language, Digits and font naming are
+/// in both editions and stay outside it.
+pub fn cjk_features(app: &DesignApp) -> bool {
+    app.session.prefs.cjk_features.unwrap_or_else(|| i18n::is_cjk(&app.ui.language))
+}
+
+/// Files that open as documents (when dropped or picked) rather than being placed: DesignCraft,
+/// IDML, and InDesign documents and templates (converted to IDML on open).
 pub fn opens_as_document(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    // InDesign files go to the open path too, which says how to bring them over (as IDML)
-    // instead of failing to place them as a graphic.
     [".designcraft", ".idml", ".indd", ".indt"].iter().any(|ext| n.ends_with(ext))
 }
 
@@ -1468,19 +1736,50 @@ pub fn now_ms() -> f64 {
     }
 }
 
-/// Is `text` the name of a key ("AltGraph", "Dead", "AudioVolumeUp") instead of typed text?
-/// Browsers report a key press as a string: the character it types, or a name made of ASCII
-/// letters and digits that starts with a capital. One key press never types such a word.
+/// Named `KeyboardEvent.key` values (W3C UI Events) that a browser reports for a key that types
+/// nothing, separated by spaces. eframe's web backend sends the ones it doesn't know as text.
+const KEY_NAMES: &str = "\
+    Unidentified Alt AltGraph CapsLock Control Fn FnLock Hyper Meta NumLock ScrollLock Shift Super Symbol SymbolLock OS Win Enter \
+    Tab ArrowDown ArrowLeft ArrowRight ArrowUp End Home PageDown PageUp Backspace Clear Copy CrSel Cut Delete EraseEof ExSel \
+    Insert Paste Redo Undo Accept Again Attn Cancel ContextMenu Esc Escape Execute Find Finish Help Pause Play Props Select \
+    ZoomIn ZoomOut BrightnessDown BrightnessUp Eject LogOff Power PowerOff PrintScreen Hibernate Standby WakeUp AllCandidates \
+    Alphanumeric CodeInput Compose Convert Dead FinalMode GroupFirst GroupLast GroupNext GroupPrevious ModeChange NextCandidate \
+    NonConvert PreviousCandidate Process SingleCandidate HangulMode HanjaMode JunjaMode Eisu Hankaku Hiragana HiraganaKatakana \
+    KanaMode KanjiMode Katakana Romaji Zenkaku ZenkakuHankaku Soft1 Soft2 Soft3 Soft4 ChannelDown ChannelUp Close MailForward \
+    MailReply MailSend MediaClose MediaFastForward MediaPause MediaPlay MediaPlayPause MediaRecord MediaRewind MediaStop \
+    MediaTrackNext MediaTrackPrevious New Open Print Save SpellCheck Key11 Key12 AudioBalanceLeft AudioBalanceRight \
+    AudioBassBoostDown AudioBassBoostToggle AudioBassBoostUp AudioFaderFront AudioFaderRear AudioSurroundModeNext AudioTrebleDown \
+    AudioTrebleUp AudioVolumeDown AudioVolumeUp AudioVolumeMute MicrophoneToggle MicrophoneVolumeDown MicrophoneVolumeUp \
+    MicrophoneVolumeMute SpeechCorrectionList SpeechInputToggle LaunchApplication1 LaunchApplication2 LaunchCalendar \
+    LaunchContacts LaunchMail LaunchMediaPlayer LaunchMusicPlayer LaunchPhone LaunchScreenSaver LaunchSpreadsheet \
+    LaunchWebBrowser LaunchWebCam LaunchWordProcessor BrowserBack BrowserFavorites BrowserForward BrowserHome BrowserRefresh \
+    BrowserSearch BrowserStop AppSwitch Call Camera CameraFocus EndCall GoBack GoHome HeadsetHook LastNumberRedial Notification \
+    MannerMode VoiceDial TV TV3DMode TVAntennaCable TVAudioDescription TVAudioDescriptionMixDown TVAudioDescriptionMixUp \
+    TVContentsMenu TVDataService TVInput TVInputComponent1 TVInputComponent2 TVInputComposite1 TVInputComposite2 TVInputHDMI1 \
+    TVInputHDMI2 TVInputHDMI3 TVInputHDMI4 TVInputVGA1 TVMediaContext TVNetwork TVNumberEntry TVPower TVRadioService TVSatellite \
+    TVSatelliteBS TVSatelliteCS TVSatelliteToggle TVTerrestrialAnalog TVTerrestrialDigital TVTimer AVRInput AVRPower ColorF0Red \
+    ColorF1Green ColorF2Yellow ColorF3Blue ColorF4Grey ColorF5Brown ClosedCaptionToggle Dimmer DisplaySwap DVR Exit \
+    FavoriteClear0 FavoriteClear1 FavoriteClear2 FavoriteClear3 FavoriteRecall0 FavoriteRecall1 FavoriteRecall2 FavoriteRecall3 \
+    FavoriteStore0 FavoriteStore1 FavoriteStore2 FavoriteStore3 Guide GuideNextDay GuidePreviousDay Info InstantReplay Link \
+    ListProgram LiveContent Lock MediaApps MediaAudioTrack MediaLast MediaSkipBackward MediaSkipForward MediaStepBackward \
+    MediaStepForward MediaTopMenu NavigateIn NavigateNext NavigateOut NavigatePrevious NextFavoriteChannel NextUserProfile \
+    OnDemand Pairing PinPDown PinPMove PinPToggle PinPUp PlaySpeedDown PlaySpeedReset PlaySpeedUp RandomToggle RcLowBattery \
+    RecordSpeedNext RfBypass ScanChannelsToggle ScreenModeNext Settings SplitScreenToggle STBInput STBPower Subtitle Teletext \
+    VideoModeNext Wink ZoomToggle";
+
+/// Is `text` the name of a key ("AltGraph", "Dead", "F13") instead of typed text?
 pub fn is_key_name(text: &str) -> bool {
-    text.len() > 1 && text.starts_with(|c: char| c.is_ascii_uppercase()) && text.chars().all(|c| c.is_ascii_alphanumeric())
+    let function_key = text.strip_prefix('F').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    function_key || KEY_NAMES.split_ascii_whitespace().any(|k| k == text)
 }
 
-/// Drop text events that are key names. eframe's web backend sends the name of every key it
-/// doesn't know as text, so AltGr typed "AltGraph" into the story. `text_field_focused`: an
-/// egui text field has the keyboard; its text comes from the browser's input events, which can
-/// hold whole words, and is left alone.
-pub fn drop_key_name_text(raw: &mut egui::RawInput, text_field_focused: bool) {
-    if !text_field_focused {
+/// Drop text events that are key names: eframe's web backend sends the name of every key it
+/// doesn't know as text, so AltGr typed "AltGraph" into the story. `text_input_focused`: an egui
+/// text field or the canvas's text caret has the keyboard, so the browser's hidden text input
+/// sends the text, which holds only typed text (whole words from autocompletion too) and is left
+/// alone.
+pub fn drop_key_name_text(raw: &mut egui::RawInput, text_input_focused: bool) {
+    if !text_input_focused {
         raw.events.retain(|e| !matches!(e, egui::Event::Text(t) if is_key_name(t)));
     }
 }
@@ -1488,6 +1787,52 @@ pub fn drop_key_name_text(raw: &mut egui::RawInput, text_field_focused: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Control panel's two-row groups were centred as if they were one row tall, so the second
+    /// row hung below the panel and was cut off.
+    #[test]
+    fn control_bar_shows_its_second_row() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
+        app.run("file.newSample", json!({})).unwrap();
+        app.ui.control_bar = true;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        let bar = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("control_bar")).unwrap().outer_rect;
+        assert!(bar.height() > 40.0, "{bar:?}");
+        // The X/Y/W/H group: its second row holds Y: and H:.
+        let group = h.ctx.read_response(egui::Id::new(("object_control", "dimensions"))).unwrap().rect;
+        assert!(bar.contains(group.left_top()), "the X/Y/W/H group {group:?} is in the Control panel {bar:?}");
+        assert!(group.bottom() <= bar.bottom(), "X/Y/W/H group {group:?} hangs below the Control panel {bar:?}");
+    }
+
+    #[test]
+    fn key_names_sent_as_text_are_dropped() {
+        let text = |t: &str| egui::Event::Text(t.to_string());
+        let events = || {
+            vec![text("AltGraph"), text("é"), text("Dead"), text("A"), text("Unidentified"), text("ß"), text("AudioVolumeUp"), text("ab"), text("Æ")]
+        };
+        let mut raw = egui::RawInput { events: events(), ..Default::default() };
+        drop_key_name_text(&mut raw, false);
+        assert_eq!(raw.events, vec![text("é"), text("A"), text("ß"), text("ab"), text("Æ")]);
+        assert!(is_key_name("F13") && is_key_name("Escape") && is_key_name("ZoomToggle") && !is_key_name("F") && !is_key_name("Fx"));
+        // Capitalised words (mobile autocompletion) are text.
+        let words = vec![text("Hello"), text("Tokyo"), text("OK"), text("Hi there")];
+        let mut raw = egui::RawInput { events: words.clone(), ..Default::default() };
+        drop_key_name_text(&mut raw, false);
+        assert_eq!(raw.events, words);
+        // A focused text field or a canvas text caret gets its text from the browser's input
+        // events, which hold whole words, key-name-like ones too ("Help").
+        let mut raw = egui::RawInput { events: events(), ..Default::default() };
+        drop_key_name_text(&mut raw, true);
+        assert_eq!(raw.events, events());
+    }
 
     /// InDesign shows 100% K as pure black on screen unless Appearance of Black says otherwise
     /// (Display All Blacks as Rich Black is its default); settings saved without the field get it too.
@@ -1498,6 +1843,17 @@ mod tests {
         assert!(saved.rich_black);
         let accurate: UiState = serde_json::from_str(r#"{"richBlack": false}"#).unwrap();
         assert!(!accurate.rich_black, "a saved choice is kept");
+    }
+
+    /// Tool readouts measured in picas whatever the document's units (the UI's unit is never set):
+    /// they follow the active document's ruler units.
+    #[test]
+    fn tool_readouts_measure_in_the_documents_units() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
+        assert_eq!(app.view_info().unit, Unit::Picas, "no document: the UI's default");
+        app.run("file.new", json!({})).unwrap();
+        app.run("document.preferences", json!({"horizontalUnits": "inches", "verticalUnits": "millimeters"})).unwrap();
+        assert_eq!(app.view_info().unit, Unit::Inches);
     }
 
     /// An app with one document that has an unsaved edit.
@@ -1994,40 +2350,37 @@ mod tests {
     /// The Control panel's two-row groups were centred as if they were one row tall, so the second
     /// row hung below the panel and was cut off.
     #[test]
-    fn control_bar_shows_its_second_row() {
-        use egui_kittest::kittest::Queryable as _;
-        let mut app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
-        app.run("file.newSample", json!({})).unwrap();
-        app.ui.control_bar = true;
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
-            |ui, app: &mut DesignApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
-            },
-            app,
-        );
-        h.run_steps(4);
-        let bar = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("control_bar")).unwrap().outer_rect;
-        assert!(bar.height() > 40.0, "{bar:?}");
-        let rows: Vec<egui::Rect> = h.query_all_by_label("Y:").map(|n| n.rect()).filter(|r| bar.contains(r.left_top())).collect();
-        assert_eq!(rows.len(), 1, "the Y: caption of the Control panel");
-        assert!(rows[0].bottom() <= bar.bottom(), "Y: caption {:?} hangs below the Control panel {bar:?}", rows[0]);
-    }
-
-    #[test]
-    fn key_names_sent_as_text_are_dropped() {
-        let text = |t: &str| egui::Event::Text(t.to_string());
-        let events = || {
-            vec![text("AltGraph"), text("é"), text("Dead"), text("A"), text("Unidentified"), text("ß"), text("AudioVolumeUp"), text("ab"), text("Æ")]
-        };
-        let mut raw = egui::RawInput { events: events(), ..Default::default() };
-        drop_key_name_text(&mut raw, false);
-        assert_eq!(raw.events, vec![text("é"), text("A"), text("ß"), text("ab"), text("Æ")]);
-        // A focused text field gets its text from input events, which can be whole words.
-        let mut raw = egui::RawInput { events: events(), ..Default::default() };
-        drop_key_name_text(&mut raw, true);
-        assert_eq!(raw.events, events());
+    fn opening_missing_fonts_offers_repeated_replacement_and_keeps_errors_visible() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({})).unwrap();
+        app.run("frame.create", json!({"rect":[0,0,200,200], "content":"text", "text":"Sample"})).unwrap();
+        let d = std::sync::Arc::make_mut(&mut app.session.doc_mut().unwrap().doc);
+        let sid = *d.stories.keys().next().unwrap();
+        d.story_mut(sid).unwrap().format_chars(0..6, |f| {
+            f.over.font_family = Some("Unavailable Test Family".into());
+            f.over.font_style = Some("Regular".into());
+        });
+        let path = std::env::temp_dir().join(format!("designcraft-font-open-{}.designcraft", std::process::id()));
+        app.run("file.save", json!({"path":path})).unwrap();
+        app.run("file.open", json!({"path":path})).unwrap();
+        let dialog = app.ui.dialog.as_mut().unwrap();
+        assert_eq!(dialog.id, "findFont");
+        assert_eq!(dialog.fields["onOpen"], true);
+        dialog.fields.insert("family".into(), json!("Unavailable Test Family"));
+        dialog.fields.insert("style".into(), json!("Regular"));
+        dialog.fields.insert("toFamily".into(), json!("Unavailable Target"));
+        dialog.fields.insert("toStyle".into(), json!("Regular"));
+        assert!(dialogs::confirm(&mut app).is_err());
+        assert!(app.ui.dialog.as_ref().unwrap().fields.contains_key("error"));
+        app.ui.dialog.as_mut().unwrap().fields.insert("toFamily".into(), json!("Source Sans 3"));
+        dialogs::confirm(&mut app).unwrap();
+        assert!(!app.ui.dialog.as_ref().unwrap().fields.contains_key("_fonts"));
+        assert!(app.run("font.list", json!({})).unwrap().as_array().unwrap().iter().all(|f| f["missing"] == false));
+        app.ui.dialog = None;
+        app.run("file.save", json!({"path":path})).unwrap();
+        app.run("file.open", json!({"path":path})).unwrap();
+        assert!(app.ui.dialog.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2093,9 +2446,43 @@ mod tests {
         for name in ["a.designcraft", "B.IDML", "c.indd", "D.INDT"] {
             assert!(opens_as_document(name), "{name}");
         }
-        for name in ["a.png", "b.pdf", "idml.txt", "c.idml.zip"] {
+        for name in ["a.png", "b.pdf", "idml.txt", "c.idml.zip", "e.indd.zip"] {
             assert!(!opens_as_document(name), "{name}");
         }
+    }
+
+    /// Files without an extension: dropped, a document opens and anything else is placed; asked
+    /// for by the operating system, they wait for the window and then open as documents.
+    #[test]
+    fn extensionless_documents_open_by_content() {
+        let path = std::env::temp_dir().join(format!("designcraft-ui-{}-Brochure", std::process::id()));
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let bytes = designcraft_engine::cmd::base64_decode(app.run("file.serialize", json!({})).unwrap()["base64"].as_str().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        let p = path.to_string_lossy().to_string();
+        app.open_dropped(&p).unwrap();
+        assert_eq!(app.session.documents().len(), 2, "a document opens, it isn't placed");
+        app.open_documents_later([p.clone()]);
+        assert_eq!(app.session.documents().len(), 2, "queued until the window is ready");
+        app.open_os_documents();
+        assert_eq!(app.session.documents().len(), 3);
+        assert_eq!(app.session.active().and_then(|d| d.path.clone()), Some(p));
+        let _ = std::fs::remove_file(&path);
+        let notes = unreadable_file("notes");
+        let e = app.open_dropped(&notes.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_file(&notes);
+        assert_eq!(alert(&app), ("Can't Place the File".to_string(), e));
+    }
+
+    #[test]
+    fn status_messages_follow_the_interface_language_but_engine_errors_stay_english() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.status_error("Table", "No table selected");
+        assert_eq!(app.ui.status, "Table: No table selected");
+        app.ui.language = "cs".into();
+        app.status_error("Table", "No table selected");
+        assert_eq!(app.ui.status, "Tabulka: No table selected");
     }
 
     #[test]
@@ -2123,20 +2510,15 @@ mod tests {
     }
 
     #[test]
-    fn a_file_dropped_while_a_parent_is_open_lands_on_the_parent() {
+    fn a_dropped_indd_file_the_converter_rejects_alerts() {
+        let path = unreadable_file("brochure.indd");
         let mut app = DesignApp::new(Session::new(), Services::default());
-        app.run("file.new", json!({"pages": 3})).unwrap();
-        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)));
-        app.run("layout.parents.edit", json!({"on": true})).unwrap();
-        let _ = app.view_mut();
-        let path = std::env::temp_dir().join(format!("designcraft-ui-{}-drop.png", std::process::id()));
-        std::fs::write(&path, designcraft_render::Rendered { width: 10, height: 10, pixels: vec![200; 400] }.to_png()).unwrap();
         let r = app.open_dropped(&path.to_string_lossy());
         let _ = std::fs::remove_file(&path);
-        r.unwrap();
-        let d = &app.session.doc().unwrap().doc;
-        assert_eq!(d.parents[0].items.len(), 1, "the graphic is on the parent spread");
-        assert!(d.spreads.iter().all(|s| s.items.is_empty()), "no document page gets it");
+        let e = r.unwrap_err();
+        assert!(e.contains("InDesign file"), "{e}");
+        assert_eq!(alert(&app), ("Can't Open the File".to_string(), e));
+        assert!(app.session.documents().is_empty());
     }
 
     #[test]
@@ -2159,6 +2541,23 @@ mod tests {
             assert!(doc.swatches.iter().any(|s| s.name == "Dropped Teal"), "{name}");
             assert!(doc.assets.is_empty(), "{name} isn't placed");
         }
+    }
+
+    #[test]
+    fn a_file_dropped_while_a_parent_is_open_lands_on_the_parent() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({"pages": 3})).unwrap();
+        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)));
+        app.run("layout.parents.edit", json!({"on": true})).unwrap();
+        let _ = app.view_mut();
+        let path = std::env::temp_dir().join(format!("designcraft-ui-{}-drop.png", std::process::id()));
+        std::fs::write(&path, designcraft_render::Rendered { width: 10, height: 10, pixels: vec![200; 400] }.to_png()).unwrap();
+        let r = app.open_dropped(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        r.unwrap();
+        let d = &app.session.doc().unwrap().doc;
+        assert_eq!(d.parents[0].items.len(), 1, "the graphic is on the parent spread");
+        assert!(d.spreads.iter().all(|s| s.items.is_empty()), "no document page gets it");
     }
 
     #[test]
@@ -2188,6 +2587,38 @@ mod tests {
         let control::Outcome::Done(r) = control::handle(&mut app, &egui::Context::default(), &req) else { panic!("app.open answers") };
         assert_eq!(r["ok"], json!(false), "{r}");
         assert!(app.ui.dialog.is_none(), "a control-channel app.open doesn't raise an alert");
+    }
+
+    /// Copied objects were pasted on the first spread whatever page was in view.
+    #[test]
+    fn paste_lands_on_the_spread_in_view() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({"pages": 3, "facingPages": false})).unwrap();
+        let id = app.run("frame.create", json!({"rect": [36, 36, 136, 136]})).unwrap()["id"].clone();
+        app.run("selection.set", json!({"ids": [id]})).unwrap();
+        app.run("edit.copy", json!({})).unwrap();
+        let pasted_on = |app: &DesignApp| {
+            let st = app.session.active().unwrap();
+            st.doc.find(st.selection.items[0]).unwrap().spread
+        };
+        // Nothing is in view before the canvas is laid out: the first spread, as in a script.
+        app.run("edit.paste", json!({})).unwrap();
+        assert_eq!(pasted_on(&app), designcraft_doc::SpreadRef::Doc(0));
+        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)));
+        canvas::go_to_page(&mut app, 2);
+        menus::activate(&mut app, "edit.pasteInPlace", &Value::Null);
+        assert_eq!(pasted_on(&app), designcraft_doc::SpreadRef::Doc(2));
+        canvas::go_to_page(&mut app, 1);
+        app.run("edit.paste", json!({})).unwrap();
+        assert_eq!(pasted_on(&app), designcraft_doc::SpreadRef::Doc(1));
+        // A parent spread while parents are edited.
+        app.run("layout.parents.edit", json!({"on": true})).unwrap();
+        app.run("edit.paste", json!({})).unwrap();
+        assert_eq!(pasted_on(&app), designcraft_doc::SpreadRef::Parent(0));
+        // With an insertion point Paste still goes into the text, where the object is anchored.
+        let story = app.run("frame.create", json!({"rect": [36, 200, 300, 400], "content": "text", "text": "ab"})).unwrap()["story"].clone();
+        app.run("text.select", json!({"story": story, "anchor": 2})).unwrap();
+        assert_eq!(app.run("edit.paste", json!({})).unwrap()["anchored"], 1);
     }
 }
 
@@ -2272,6 +2703,24 @@ mod import_warning_tests {
     }
 
     #[test]
+    fn find_font_on_open_outranks_the_warning_alert() {
+        let mut app = app();
+        app.run("frame.create", json!({"rect": [0, 0, 200, 200], "content": "text", "text": "Sample"})).unwrap();
+        let d = std::sync::Arc::make_mut(&mut app.session.doc_mut().unwrap().doc);
+        let sid = *d.stories.keys().next().unwrap();
+        let story = d.story_mut(sid).unwrap();
+        story.format_chars(0..6, |f| f.over.font_family = Some("Unavailable Test Family".into()));
+        story.paras[0].para.grep_styles = Some(vec![designcraft_doc::GrepStyle { style: "Keep".into(), pattern: "[a-".into() }]);
+        let path = std::env::temp_dir().join(format!("designcraft-font-warning-{}.designcraft", std::process::id()));
+        app.run("file.save", json!({"path": path})).unwrap();
+        let result = app.open_file("file.open", json!({"path": path}));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap()["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(app.ui.dialog.as_ref().unwrap().id, "findFont");
+        assert!(app.ui.status.contains("GREP style not applied"), "{}", app.ui.status);
+    }
+
+    #[test]
     fn complete_import_does_not_show_a_warning() {
         let mut app = app();
         let result = app
@@ -2300,22 +2749,29 @@ pub(crate) mod test_window {
     }
 
     /// The window at a size in points and a scale, with a new document open.
-    pub fn open_scaled(mut app: crate::DesignApp, size: egui::Vec2, pixels_per_point: f32) -> Harness<'static, Window> {
+    pub fn open_scaled(app: crate::DesignApp, size: egui::Vec2, pixels_per_point: f32) -> Harness<'static, Window> {
+        open_stepped(app, size, pixels_per_point, 0.25)
+    }
+
+    /// As `open_scaled`, with `step_dt` seconds between frames (a double-click needs its two
+    /// clicks closer together than the default quarter second).
+    pub fn open_stepped(mut app: crate::DesignApp, size: egui::Vec2, pixels_per_point: f32, step_dt: f32) -> Harness<'static, Window> {
         if app.session.active().is_none() {
             app.run("file.new", serde_json::json!({})).unwrap();
         }
-        let mut h = Harness::builder().with_size(size).with_pixels_per_point(pixels_per_point).with_max_steps(1000).build_ui_state(
-            |ui, w: &mut Window| {
-                // The builder runs a frame before the texture size can be raised: skip it.
-                if !w.ready {
-                    return;
-                }
-                let ctx = ui.ctx().clone();
-                w.app.logic(&ctx);
-                w.app.ui(ui);
-            },
-            Window { app, ready: false },
-        );
+        let mut h =
+            Harness::builder().with_size(size).with_pixels_per_point(pixels_per_point).with_max_steps(1000).with_step_dt(step_dt).build_ui_state(
+                |ui, w: &mut Window| {
+                    // The builder runs a frame before the texture size can be raised: skip it.
+                    if !w.ready {
+                        return;
+                    }
+                    let ctx = ui.ctx().clone();
+                    w.app.logic(&ctx);
+                    w.app.ui(ui);
+                },
+                Window { app, ready: false },
+            );
         h.input_mut().max_texture_side = Some(8192);
         h.state_mut().ready = true;
         h.run_steps(6);
@@ -2451,7 +2907,7 @@ mod browser_import_tests {
         let mut source = Session::new();
         source.execute("file.new", &json!({"title": "source"})).unwrap();
         source.execute("frame.create", &json!({"rect": [10, 10, 50, 50], "content": "text", "text": "placed"})).unwrap();
-        let native = designcraft_engine::cmd::to_bytes(&source.doc().unwrap().doc);
+        let native = designcraft_engine::cmd::to_bytes(&source.doc().unwrap().doc).unwrap();
         let idml = designcraft_idml::export_idml(&source.doc().unwrap().doc);
         for (name, bytes) in [("source.designcraft", native), ("source.idml", idml)] {
             let mut app = app();
@@ -2554,7 +3010,7 @@ mod browser_import_tests {
     #[test]
     fn drop_routing_and_nonlayout_open_remain_compatible() {
         let mut app = app();
-        let native = designcraft_engine::cmd::to_bytes(&app.session.doc().unwrap().doc);
+        let native = designcraft_engine::cmd::to_bytes(&app.session.doc().unwrap().doc).unwrap();
         let request = app.import_request("drop");
         deliver(&mut app, request, "document.designcraft", native);
         assert_eq!(app.session.documents().len(), 2);
@@ -2629,5 +3085,138 @@ mod browser_import_tests {
         assert!(dialogs::confirm(&mut app).is_err());
         assert!(app.pending_pdf.is_none());
         assert!(app.session.doc().unwrap().doc.assets.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod load_styles_tests {
+    use super::*;
+
+    /// A client's document on disk: Head based on Body, and a Lead character style.
+    fn client_bytes() -> Vec<u8> {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Body", "chars": {"size": 10}})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Head", "basedOn": "Body", "chars": {"size": 20}})).unwrap();
+        s.execute("style.character.create", &json!({"name": "Lead", "chars": {"size": 9}})).unwrap();
+        designcraft_engine::cmd::base64_decode(s.execute("file.serialize", &json!({})).unwrap()["base64"].as_str().unwrap())
+    }
+
+    /// An app with a document that has its own 8 pt Body, and a picker that answers with the client's file.
+    fn app_and_file(test: &str) -> (DesignApp, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("designcraft-load-styles-{}-{test}.designcraft", std::process::id()));
+        std::fs::write(&path, client_bytes()).unwrap();
+        let picked = path.to_string_lossy().to_string();
+        let services = Services { pick_open: Some(Box::new(move |purpose| (purpose == "styles").then(|| picked.clone()))), ..Default::default() };
+        let mut app = DesignApp::new(Session::new(), services);
+        app.run("file.new", json!({})).unwrap();
+        app.run("style.paragraph.create", json!({"name": "Body", "chars": {"size": 8}})).unwrap();
+        (app, path)
+    }
+
+    fn names(app: &DesignApp) -> (Vec<String>, Vec<String>) {
+        let st = &app.session.doc().unwrap().doc.styles;
+        (st.paragraph.iter().skip(2).map(|s| s.name.clone()).collect(), st.character.iter().skip(1).map(|s| s.name.clone()).collect())
+    }
+
+    #[test]
+    fn load_all_text_styles_asks_which_styles_of_the_picked_file_to_load() {
+        let (mut app, path) = app_and_file("all");
+        app.run("app.loadTextStyles", json!({})).unwrap();
+        let d = app.ui.dialog.as_mut().expect("the Load Styles dialog");
+        let row = |name: &str, conflict: bool| json!({"name": name, "conflict": conflict});
+        assert_eq!(d.id, "loadStyles");
+        assert_eq!(d.fields["paragraph"], json!([row("[Basic Paragraph]", false), row("Body", true), row("Head", false)]));
+        assert_eq!(d.fields["character"], json!([row("Lead", false)]));
+        // Lead is unchecked; the rest loads, and Body takes the file's definition.
+        d.fields["character"][0]["on"] = json!(false);
+        dialogs::confirm(&mut app).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(app.ui.dialog.is_none());
+        assert_eq!(names(&app), (vec!["Body".to_string(), "Head".to_string()], vec![]));
+        assert_eq!(app.session.doc().unwrap().doc.styles.para("Body").unwrap().chars.size, Some(10.0));
+    }
+
+    #[test]
+    fn the_dialog_applies_the_chosen_conflict_rule() {
+        let (mut app, path) = app_and_file("rename");
+        app.run("app.loadParagraphStyles", json!({})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        assert_eq!(d.fields["character"], json!([]), "Load Paragraph Styles offers no character styles");
+        assert_eq!(d.fields["conflicts"], "redefine");
+        d.fields.insert("conflicts".into(), json!("autoRename"));
+        dialogs::confirm(&mut app).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(names(&app), (vec!["Body".to_string(), "Body 2".to_string(), "Head".to_string()], vec![]));
+        assert_eq!(app.session.doc().unwrap().doc.styles.para("Body").unwrap().chars.size, Some(8.0));
+    }
+
+    #[test]
+    fn load_character_styles_offers_only_character_styles() {
+        let (mut app, path) = app_and_file("character");
+        app.run("app.loadCharacterStyles", json!({})).unwrap();
+        assert_eq!(app.ui.dialog.as_ref().unwrap().fields["paragraph"], json!([]));
+        dialogs::confirm(&mut app).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(names(&app), (vec!["Body".to_string()], vec!["Lead".to_string()]));
+    }
+
+    /// A script can put anything into the dialog's rows: drawing and ticking them must not panic.
+    #[test]
+    fn the_dialog_draws_and_ticks_rows_that_are_no_style_rows() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut h = test_window::open(DesignApp::new(Session::new(), Services::default()), egui::vec2(1200.0, 800.0));
+        h.state_mut().app.ui.dialog = Some(dialogs::Dialog::new(
+            "loadStyles",
+            json!({"path": "x", "conflicts": 3, "paragraph": [1, "Body", null, {"name": 7}, {"name": "Head", "conflict": true}], "character": "none"}),
+        ));
+        h.run_steps(3);
+        let button = h.get_by_label("Deselect All").rect().center();
+        test_window::click_at(&mut h, button);
+        let d = h.state().app.ui.dialog.as_ref().unwrap();
+        assert_eq!(d.fields["paragraph"][4]["on"], false);
+        assert_eq!(d.fields["paragraph"][0], 1, "what is no style row stays as it is");
+        assert!(dialogs::confirm(&mut h.state_mut().app).is_err(), "there is no file `x`");
+    }
+
+    #[test]
+    fn no_file_or_no_document_opens_no_dialog() {
+        let (mut app, path) = app_and_file("none");
+        std::fs::remove_file(&path).unwrap();
+        // The picked file can't be read.
+        assert!(app.run("app.loadTextStyles", json!({})).is_err());
+        assert!(app.ui.dialog.as_ref().is_none_or(|d| d.id != "loadStyles"));
+        // The picker is cancelled.
+        app.ui.dialog = None;
+        app.services.pick_open = Some(Box::new(|_| None));
+        app.run("app.loadTextStyles", json!({})).unwrap();
+        assert!(app.ui.dialog.is_none());
+        // No document: the picker isn't shown at all.
+        app.run("file.close", json!({})).unwrap();
+        app.services.pick_open = Some(Box::new(|_| panic!("asked for a file without a document")));
+        assert!(app.run("app.loadTextStyles", json!({})).is_err());
+    }
+
+    #[test]
+    fn styles_from_an_asynchronous_picker_load_into_the_document_that_asked() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let services = Services {
+            inbox: Some(Inbox::default()),
+            open_async: Some(Box::new(move |request| seen.lock().unwrap().push(request))),
+            ..Default::default()
+        };
+        let mut app = DesignApp::new(Session::new(), services);
+        app.run("file.new", json!({"title": "A"})).unwrap();
+        app.run("app.loadCharacterStyles", json!({})).unwrap();
+        let request = asked.lock().unwrap().pop().expect("the picker was asked");
+        assert_eq!(request.purpose, "styles:character");
+        // Another document is in front when the file arrives.
+        app.run("file.new", json!({"title": "B"})).unwrap();
+        app.services.inbox.as_ref().unwrap().lock().unwrap().push(ImportedFile { request, name: "client.designcraft".into(), bytes: client_bytes() });
+        app.drain_inbox();
+        assert_eq!(app.session.active_index(), Some(0));
+        assert_eq!(names(&app), (vec![], vec!["Lead".to_string()]));
+        assert!(app.session.documents()[1].doc.styles.char_style("Lead").is_none());
     }
 }

@@ -8,9 +8,13 @@ use std::sync::{Arc, OnceLock};
 
 pub use resvg::usvg;
 
+pub mod colour;
 mod eps;
+mod jpeg;
 mod psd;
-pub use eps::{bounding_box as eps_bounding_box, eps_proxy, is_eps};
+mod tone;
+pub use eps::{bounding_box as eps_bounding_box, eps_pixel_size, eps_png, eps_proxy, eps_size, is_eps};
+pub use tone::{Tone, tone};
 
 /// CSS pixels (SVG user units) → points.
 pub const PT_PER_PX: f64 = 0.75;
@@ -33,6 +37,9 @@ pub fn is_svg(bytes: &[u8]) -> bool {
 
 /// MIME type of a placed graphic.
 pub fn mime(bytes: &[u8]) -> &'static str {
+    if is_eps(bytes) {
+        return "application/postscript";
+    }
     if is_pdf(bytes) {
         return "application/pdf";
     }
@@ -68,22 +75,30 @@ fn svg_options() -> &'static usvg::Options<'static> {
         db.set_sans_serif_family("Source Sans 3");
         db.set_monospace_family("JetBrains Mono");
         let font_resolver = usvg::FontResolver { select_font: select_font(), select_fallback: select_fallback() };
-        usvg::Options { fontdb: Arc::new(db), font_family: "Source Sans 3".into(), font_resolver, ..Default::default() }
+        // Images inside an SVG come only from `data:` URLs: an `href` naming a file is not read
+        // (it is left out, as usvg leaves out an image it can't load).
+        let image_href_resolver =
+            usvg::ImageHrefResolver { resolve_data: usvg::ImageHrefResolver::default_data_resolver(), resolve_string: Box::new(|_, _| None) };
+        usvg::Options { fontdb: Arc::new(db), font_family: "Source Sans 3".into(), font_resolver, image_href_resolver, ..Default::default() }
     })
 }
 
 /// A family the SVG names that isn't bundled comes from the shared fonts (installed ones too),
-/// as it would in a text frame. A name that is no family's but a face's PostScript name (as
-/// Illustrator's SVG export writes them: `font-family="'MyriadPro-Regular'"`) sets the text in
-/// that face, whatever font-weight and font-style say: the name already picks the weight and
-/// style, and a family's other faces would contradict it. Families listed before it come first.
+/// as it would in a text frame, and matches in any case, as it does there. A name that is no
+/// family's but a face's PostScript name (as Illustrator's SVG export writes them:
+/// `font-family="'MyriadPro-Regular'"`) sets the text in that face, whatever font-weight and
+/// font-style say: the name already picks the weight and style, and a family's other faces would
+/// contradict it. Families listed before it come first.
 fn select_font() -> usvg::FontSelectionFn<'static> {
-    let bundled = usvg::FontResolver::default_font_selector();
+    use usvg::fontdb::{Family, Query, Stretch, Style, Weight};
     Box::new(move |font, db| {
         let fonts = designcraft_fonts::FontDb::global();
+        let spelled = |db: &usvg::fontdb::Database, name: &str| {
+            db.faces().flat_map(|f| &f.families).find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(n, _)| n.clone())
+        };
         for family in font.families() {
             if let usvg::FontFamily::Named(name) = family
-                && !has_family(db, name)
+                && spelled(db, name).is_none()
             {
                 if fonts.has_family(name) {
                     for style in fonts.styles(name) {
@@ -98,7 +113,7 @@ fn select_font() -> usvg::FontSelectionFn<'static> {
         }
         for family in font.families() {
             match family {
-                usvg::FontFamily::Named(name) if !has_family(db, name) => {
+                usvg::FontFamily::Named(name) if spelled(db, name).is_none() => {
                     if let Some(id) = postscript_face(db, name) {
                         return Some(id);
                     }
@@ -107,13 +122,48 @@ fn select_font() -> usvg::FontSelectionFn<'static> {
                 _ => break,
             }
         }
-        bundled(font, db)
+        // usvg's default query, but with each named family spelled as the database spells it:
+        // fontdb compares names exactly, so "DeJaVu SaNs" would quietly fall to the serif.
+        let names: Vec<Option<String>> = font
+            .families()
+            .iter()
+            .map(|f| match f {
+                usvg::FontFamily::Named(name) => Some(spelled(db, name).unwrap_or_else(|| name.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut families: Vec<Family> = font
+            .families()
+            .iter()
+            .zip(&names)
+            .map(|(f, name)| match f {
+                usvg::FontFamily::Serif => Family::Serif,
+                usvg::FontFamily::SansSerif => Family::SansSerif,
+                usvg::FontFamily::Cursive => Family::Cursive,
+                usvg::FontFamily::Fantasy => Family::Fantasy,
+                usvg::FontFamily::Monospace => Family::Monospace,
+                usvg::FontFamily::Named(_) => Family::Name(name.as_deref().unwrap_or_default()),
+            })
+            .collect();
+        families.push(Family::Serif);
+        let stretch = match font.stretch() {
+            usvg::FontStretch::UltraCondensed => Stretch::UltraCondensed,
+            usvg::FontStretch::ExtraCondensed => Stretch::ExtraCondensed,
+            usvg::FontStretch::Condensed => Stretch::Condensed,
+            usvg::FontStretch::SemiCondensed => Stretch::SemiCondensed,
+            usvg::FontStretch::Normal => Stretch::Normal,
+            usvg::FontStretch::SemiExpanded => Stretch::SemiExpanded,
+            usvg::FontStretch::Expanded => Stretch::Expanded,
+            usvg::FontStretch::ExtraExpanded => Stretch::ExtraExpanded,
+            usvg::FontStretch::UltraExpanded => Stretch::UltraExpanded,
+        };
+        let style = match font.style() {
+            usvg::FontStyle::Normal => Style::Normal,
+            usvg::FontStyle::Italic => Style::Italic,
+            usvg::FontStyle::Oblique => Style::Oblique,
+        };
+        db.query(&Query { families: &families, weight: Weight(font.weight()), stretch, style })
     })
-}
-
-/// Does a face in the SVG's font database have family `name` (ignoring case)?
-fn has_family(db: &usvg::fontdb::Database, name: &str) -> bool {
-    db.faces().any(|f| f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)))
 }
 
 /// The face in the SVG's font database with PostScript name `name` (ignoring case).
@@ -187,11 +237,19 @@ pub fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
         let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         return Some((be(18), be(14)));
     }
-    image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+        // `image` doesn't read five-sample CMYK with alpha.
+        .or_else(|| tiff_decoder(bytes)?.dimensions().ok())
 }
 
-/// Straight (non-premultiplied) RGBA8 of a raster.
+/// Straight (non-premultiplied) RGBA8 of a raster in display sRGB: an embedded ICC profile is
+/// applied, and CMYK goes through its own profile or the working CMYK space ([`colour`]).
 pub fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
+    use colour::{DisplayColour, Pixels, to_display_rgba};
     if is_psd(bytes) {
         return psd::decode(bytes);
     }
@@ -204,7 +262,24 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
     if is_eps(bytes) {
         return decode_rgba(&eps_proxy(bytes)?.0);
     }
-    Some(decode_to_rgba8(&image::load_from_memory(bytes).ok()?))
+    if let Some((raster, icc)) = jpeg::decode_cmyk(bytes) {
+        return to_display_rgba(Pixels::Cmyk(raster), icc.as_deref(), &DisplayColour::active());
+    }
+    if let Some(raster) = decode_cmyk_tiff(bytes) {
+        return to_display_rgba(Pixels::Cmyk(raster), embedded_icc(bytes).as_deref(), &DisplayColour::active());
+    }
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = decode_to_rgba8(&img);
+    let Some(icc) = embedded_icc(bytes) else { return Some(rgba) };
+    let px = if img.color().has_color() { Pixels::Rgb(rgba) } else { Pixels::Gray(rgba) };
+    to_display_rgba(px, Some(&icc), &DisplayColour::active())
+}
+
+/// The ICC profile embedded in a PNG, JPEG, TIFF or WebP.
+fn embedded_icc(bytes: &[u8]) -> Option<Vec<u8>> {
+    use image::ImageDecoder;
+    let mut d = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    d.icc_profile().ok().flatten()
 }
 
 /// Fresh raster decodes are sRGB in the pinned image decoder. Expanding an L8 value to
@@ -442,6 +517,39 @@ mod tests {
         assert!(!is_svg(b"\x89PNG"));
     }
 
+    #[test]
+    fn svg_images_come_only_from_data_urls() {
+        let dir = std::env::temp_dir().join(format!("dc-svg-href-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("red.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(&file).unwrap();
+        let blue = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Crect width='10' height='10' fill='blue'/%3E%3C/svg%3E";
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="10">
+<image x="0" y="0" width="10" height="10" href="{}"/>
+<image x="10" y="0" width="10" height="10" href="{blue}"/>
+<image x="20" y="0" width="10" height="10" href="/etc/hostname"/>
+</svg>"#,
+            file.display()
+        );
+        // The image nodes usvg kept: only the data URL's (PDF export embeds every one).
+        fn images(g: &usvg::Group) -> usize {
+            g.children()
+                .iter()
+                .map(|n| match n {
+                    usvg::Node::Group(g) => images(g),
+                    usvg::Node::Image(_) => 1,
+                    _ => 0,
+                })
+                .sum()
+        }
+        assert_eq!(images(svg_tree(svg.as_bytes()).unwrap().root()), 1, "files the SVG names are not read");
+        let (px, w, _) = render_svg(svg.as_bytes(), 30).unwrap();
+        let at = |x: usize, y: usize| px[(y * w as usize + x) * 4..][..4].to_vec();
+        assert_eq!(at(15, 5), [0, 0, 255, 255], "a data URL is drawn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The family of the font that sets each text glyph of `svg`, and the glyph's id.
     fn glyph_families(svg: &str) -> Vec<(String, u16)> {
         fn walk(g: &usvg::Group, tree: &usvg::Tree, out: &mut Vec<(String, u16)>) {
@@ -477,6 +585,27 @@ mod tests {
         // Characters the bundled default lacks: a shared face that has them, not the default.
         let set = glyph_families(&text("", "한글"));
         assert!(set.len() == 2 && set.iter().all(|(f, gid)| f != "Source Sans 3" && *gid != 0), "{set:?}");
+    }
+
+    #[test]
+    fn svg_family_names_match_in_any_case() {
+        let font = designcraft_fonts::testing::font_with("DC Test SVG Casing", &['A', 'b']).unwrap();
+        designcraft_fonts::FontDb::global().add_font(font);
+        let text = |family: &str, attrs: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text y="30" font-size="20" font-family="{family}"{attrs}>Ab</text></svg>"#
+            )
+        };
+        for family in ["DC Test SVG Casing", "dc test svg casing", "DC TEST svg Casing", "Nope, dc test SVG casing, serif"] {
+            let set = glyph_families(&text(family, ""));
+            assert!(set.len() == 2 && set.iter().all(|(f, gid)| f == "DC Test SVG Casing" && *gid != 0), "{family}: {set:?}");
+        }
+        // Weight and style still reach the query: there's only a regular face, so it sets the text.
+        let set = glyph_families(&text("dc test svg casing", r#" font-weight="700" font-style="italic""#));
+        assert!(set.len() == 2 && set.iter().all(|(f, _)| f == "DC Test SVG Casing"), "{set:?}");
+        // A family nobody has still falls to the bundled serif.
+        let set = glyph_families(&text("DC Test SVG Nobody", ""));
+        assert!(set.len() == 2 && set.iter().all(|(f, _)| f == "Source Serif 4"), "{set:?}");
     }
 
     /// The PostScript name of the face that sets the text of `svg` (one face for all of it).
@@ -585,8 +714,10 @@ mod tests {
         assert_eq!(mime(&b), "image/tiff");
         assert!(is_cmyk_tiff(&b));
         assert_eq!(decode_cmyk_tiff(&b), Some(CmykRaster { width: 2, height: 1, cmyk: px.to_vec(), alpha: None }));
-        // The screen still gets RGB.
-        assert_eq!(decode_rgba(&b).unwrap().get_pixel(0, 0).0, [0, 0, 0, 255]);
+        // The screen gets RGB through the working CMYK space.
+        let raster = CmykRaster { width: 2, height: 1, cmyk: px.to_vec(), alpha: None };
+        let want = colour::to_display_rgba(colour::Pixels::Cmyk(raster), None, &colour::DisplayColour::active()).unwrap();
+        assert_eq!(decode_rgba(&b).unwrap(), want);
 
         let b = tiff_of::<CMYK16>(2, 1, &[0, 0, 0, 65_535, 0, 32_896, 65_535, 0], false);
         assert_eq!(decode_cmyk_tiff(&b).unwrap().cmyk, [0, 0, 0, 255, 0, 128, 255, 0]);
@@ -653,6 +784,13 @@ mod tests {
         assert_eq!(pixel_size(&b), Some((2, 2)));
         let px: Vec<_> = decode_rgba(&b).expect("decodes").pixels().map(|p| p.0).collect();
         assert_eq!(px, [[10, 20, 30, 255], [255, 0, 0, 255], [0, 128, 255, 255], [10, 20, 30, 255]]);
+    }
+
+    #[test]
+    fn cmyk_tiff_with_alpha_reports_its_pixel_size() {
+        use tiff::encoder::colortype::CMYKA8;
+        let b = tiff_of::<CMYKA8>(2, 1, &[0, 0, 0, 255, 255, 0, 0, 0, 0, 0], true);
+        assert_eq!(pixel_size(&b), Some((2, 1)));
     }
 
     #[test]

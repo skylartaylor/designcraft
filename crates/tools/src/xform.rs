@@ -290,6 +290,28 @@ fn image_under(cx: &ToolContext, p: Point) -> Option<(SpreadRef, Point)> {
 #[derive(Default)]
 pub struct EyedropperTool;
 
+/// The palette tool only requests a preview. Adding the swatches is a separate command.
+pub struct ColorThemeTool;
+
+impl Tool for ColorThemeTool {
+    fn id(&self) -> &'static str {
+        "colorTheme"
+    }
+    fn pointer(&mut self, cx: &ToolContext, ev: &PointerEvent) -> Vec<Action> {
+        if ev.kind != PointerKind::Down {
+            return vec![];
+        }
+        let Some((_, id)) = cx.hit(ev.pos) else { return vec![] };
+        if cx.doc.item(id).and_then(|it| it.graphic()).is_none() {
+            return vec![];
+        }
+        vec![Action::Dialog("colorTheme".into(), json!({"id": id.0}))]
+    }
+    fn cursor(&self, _cx: &ToolContext, _p: Point, _m: Mods) -> Cursor {
+        Cursor::Eyedropper
+    }
+}
+
 impl Tool for EyedropperTool {
     fn id(&self) -> &'static str {
         "eyedropper"
@@ -299,18 +321,28 @@ impl Tool for EyedropperTool {
             return vec![];
         }
         let selected = !cx.selection.items.is_empty() || cx.selection.text.is_some() || cx.selection.cells.is_some();
+        let hit = cx.hit(ev.pos);
         // A placed image under the pointer is sampled (its layer may be locked: sampling changes nothing).
         if selected && let Some((sr, at)) = image_under(cx, ev.pos) {
-            // To the fill or stroke in front in the toolbox, as in InDesign.
+            // Where the image shows no opaque pixel, the engine matches the clicked object instead.
             let mut p = json!({"at": [at.x, at.y], "spread": sr});
+            if let Some((_, id)) = hit {
+                p["matchFrom"] = json!(id.0);
+            }
+            // To the fill or stroke in front in the toolbox, as in InDesign.
             if cx.stroke_in_front {
                 p["target"] = json!("stroke");
             }
             return vec![Action::Exec("color.sample".into(), p)];
         }
-        let Some((_, id)) = cx.hit(ev.pos) else { return vec![] };
+        let Some((sr, id)) = hit else { return vec![] };
         if !selected {
             return vec![Action::Exec("selection.set".into(), json!({"ids": [id.0]}))];
+        }
+        // With text selected, clicking text picks up its formatting (InDesign's Eyedropper).
+        if cx.selection.text.is_some() && cx.doc.item(id).is_some_and(|it| it.is_text_frame()) {
+            let p = cx.layout.to_spread(sr, ev.pos);
+            return vec![Action::Exec("type.pickUpFormat".into(), json!({"frame": id.0, "point": [p.x, p.y]}))];
         }
         vec![Action::Exec("object.matchAttributes".into(), json!({"from": id.0}))]
     }

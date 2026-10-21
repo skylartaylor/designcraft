@@ -342,7 +342,15 @@ impl Renderer {
         let view = Rect::new(0.0, 0.0, w as f64, h as f64);
         let area = self.transparent_area(f, sr).unwrap_or(view);
         let area = Rect::new(area.x0.floor() - 1.0, area.y0.floor() - 1.0, area.x1.ceil() + 1.0, area.y1.ceil() + 1.0).intersect(view);
-        let rgb = RenderOptions { paper: false, background: None, page_shadow: false, blend_space_view: false, ..f.opts.clone() };
+        // The document grid is drawn once, by the caller, behind and in front of all this.
+        let rgb = RenderOptions {
+            paper: false,
+            background: None,
+            page_shadow: false,
+            blend_space_view: false,
+            document_grid: Vec::new(),
+            ..f.opts.clone()
+        };
         if area.width() < 1.0 || area.height() < 1.0 {
             // Nothing transparent in view: the ordinary drawing is exact.
             self.draw_spread(ctx, &Frame { opts: &rgb, ..*f }, sr);

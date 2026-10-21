@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use designcraft_compose::Cache;
 use designcraft_doc::build::NewDocument;
-use designcraft_doc::{Asset, AssetId, Content, Document, Graphic, Item, ItemId, Shape, SpreadRef};
+use designcraft_doc::{Asset, AssetId, Content, Document, Graphic, Item, ItemId, PdfCrop, Shape, SpreadRef};
 use designcraft_geom::{Affine, Rect, shapes};
-use designcraft_render::{Rendered, Renderer, pdf_page_box, pdf_page_size};
+use designcraft_render::{Rendered, Renderer, pdf_crop_box, pdf_page_size};
 use hayro::hayro_interpret::Function;
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Object, ObjectIdentifier};
@@ -74,12 +74,20 @@ fn placed(size: f64, pdf: Vec<u8>) -> Rendered {
     std::thread::spawn(move || {
         let mut d = Document::new(&NewDocument { width: size, height: size, facing_pages: false, ..Default::default() });
         let id = AssetId(d.alloc());
-        let asset =
-            d.add_asset(Asset { id, name: "art.pdf".into(), mime: "application/pdf".into(), link: None, data: Arc::new(pdf), pixels: None, page: 0 });
+        let asset = d.add_asset(Asset { id, name: "art.pdf".into(), mime: "application/pdf".into(), data: Arc::new(pdf), ..Default::default() });
         let id = ItemId(d.alloc());
         let mut item = Item::new(id, d.default_layer(), Shape::Rectangle, shapes::rectangle(Rect::new(0.0, 0.0, size, size)));
-        item.content =
-            Content::Graphic(Graphic { asset, size: (size, size), xf: Affine::IDENTITY, auto_fit: Default::default(), fit_align: 4, crop: [0.0; 4] });
+        item.content = Content::Graphic(Graphic {
+            asset,
+            size: (size, size),
+            xf: Affine::IDENTITY,
+            clip: None,
+            auto_fit: Default::default(),
+            fit_align: 4,
+            crop: [0.0; 4],
+            wrap: Default::default(),
+            fill: Default::default(),
+        });
         d.insert_item(SpreadRef::Doc(0), item, None).unwrap();
         let mut renderer = Renderer::new();
         renderer.threads = 0;
@@ -238,12 +246,19 @@ fn mesh_shadings_with_many_patches_or_no_rows_finish() {
     }
 }
 
-/// A page with `/UserUnit 2` is twice its media box in points, and Image Import Options › Crop
-/// to measures the trim box in points as well.
+/// A page with `/UserUnit 2` is twice its media box in points, and the crop boxes import offers
+/// are measured in points as well.
 #[test]
 fn a_page_with_a_user_unit_and_its_boxes_are_sized_in_points() {
     let page = pdf("/MediaBox[0 0 100 50]/TrimBox[10 10 90 40]/UserUnit 2", "", &[]);
     assert_eq!(pdf_page_size(&page, 0), Some((200.0, 100.0)));
-    assert_eq!(pdf_page_box(&page, 0, "trim"), Some((20.0, 20.0, 160.0, 60.0)));
-    assert_eq!(pdf_page_box(&page, 0, "media"), Some((0.0, 0.0, 200.0, 100.0)));
+    let near = |crop: PdfCrop, frac: [f64; 4], size: (f64, f64)| {
+        let (f, s) = pdf_crop_box(&page, 0, crop).unwrap();
+        assert!(
+            f.iter().zip(frac).all(|(a, b)| (a - b).abs() < 1e-6) && (s.0 - size.0).abs() < 1e-6 && (s.1 - size.1).abs() < 1e-6,
+            "{crop:?}: {f:?} {s:?}"
+        );
+    };
+    near(PdfCrop::Trim, [0.1, 0.2, 0.9, 0.8], (160.0, 60.0));
+    near(PdfCrop::Media, [0.0, 0.0, 1.0, 1.0], (200.0, 100.0));
 }

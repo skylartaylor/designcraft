@@ -4,7 +4,15 @@ use designcraft_doc::{LAYER_COLORS, Layer, LayerId, Margins, SpreadId};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, cmd, has_doc, ok, str_param};
-use crate::Result;
+use crate::{Result, Session};
+
+/// A start page number parameter: a whole number in 1..=[`designcraft_doc::MAX_PAGE_NUMBER`].
+fn start_number(cmd: &str, key: &str, v: &Value) -> Result<u32> {
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| (1..=designcraft_doc::MAX_PAGE_NUMBER).contains(n))
+        .ok_or_else(|| bad(cmd, format!("`{key}` must be a whole number from 1 to {}", designcraft_doc::MAX_PAGE_NUMBER)))
+}
 
 /// Each page's margin box, by spread and page id.
 fn margin_boxes(d: &designcraft_doc::Document) -> Vec<(designcraft_doc::SpreadRef, designcraft_doc::PageId, designcraft_geom::Rect)> {
@@ -50,6 +58,9 @@ fn adjust_layout(d: &mut designcraft_doc::Document, before: &[(designcraft_doc::
             } else {
                 let inner = it.xf.inverse() * m * it.xf;
                 it.path.transform(inner);
+                if let Some(w) = &mut it.wrap.path {
+                    w.transform(inner);
+                }
                 let ib = it.inner_bounds();
                 if let designcraft_doc::Content::Graphic(g) = &mut it.content {
                     // Content keeps its size but moves with the frame; auto-fit refits.
@@ -101,14 +112,14 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Pages…",
             ["Layout", "Pages"],
             Some("Cmd+Shift+P"),
-            "{count?: 1, after?: page index (default: last), parent?: \"A\"|null}",
+            "{count?: 1, after?: page index (default: last), parent?: id|\"A-Parent\"|\"A\"|null}",
             has_doc,
             |s, p| {
                 let count = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 9999) as usize;
                 let st = s.doc()?;
                 let n = st.doc.page_count();
                 let after = p.get("after").and_then(Value::as_u64).map(|v| usize::try_from(v).unwrap_or(usize::MAX)).unwrap_or(n.saturating_sub(1));
-                let parent = parent_ref(&st.doc, p.get("parent")).unwrap_or_else(|| st.doc.parents.first().map(|x| x.id));
+                let parent = parent_ref("layout.pages.insert", &st.doc, p.get("parent"))?.unwrap_or_else(|| st.doc.parents.first().map(|x| x.id));
                 s.edit(|d, _| {
                     let ids = d.insert_pages(Some(after), count, parent)?;
                     Ok(json!({"pages": ids.len(), "total": d.page_count()}))
@@ -165,7 +176,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Duplicate Spread",
             ["Layout", "Pages"],
             None,
-            "{spread, atEnd?: bool (Duplicate Spread at End of Document; the Pages panel's New Page button takes a dropped page there), to?: page index the copied pages move to, in the same undo step (the Pages panel's Alt-drag)} → {page: the copy's first page (0-based)} — the spread's pages (size, margins, columns, guides, liquid rule) and items",
+            "{spread, atEnd?: bool (Duplicate Spread at End of Document; the Pages panel's New Page button takes a dropped page there), to?: page index the copied pages move to in the same undo step (the Pages panel's Alt-drag)} → {page: the copy's first page (0-based)} — the spread's pages (size, margins, columns, guides, liquid rule) and items",
             has_doc,
             |s, p| {
                 let si = p.get("spread").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -222,7 +233,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Parent to Pages…",
             ["Layout", "Pages"],
             None,
-            "{pages: [index], parent: \"A\"|null}",
+            "{pages: [index], parent: id|\"A-Parent\"|\"A\"|null (null or \"[None]\" clears)}",
             has_doc,
             |s, p| {
                 let pages: Vec<usize> = p
@@ -230,7 +241,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Value::as_u64).map(|v| v as usize).collect())
                     .unwrap_or_default();
-                let parent = parent_ref(&s.doc()?.doc, p.get("parent")).unwrap_or(None);
+                let parent = parent_ref("layout.pages.applyParent", &s.doc()?.doc, p.get("parent"))?.unwrap_or(None);
                 s.edit(|d, _| {
                     d.apply_parent(&pages, parent)?;
                     ok()
@@ -246,63 +257,108 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(json!({"id": id.0, "prefix": prefix}))
             })
         }),
-        cmd!(noundo "layout.parents.edit", "Edit Parents", [], None, "{on: bool} — show parent spreads on the canvas", has_doc, |s, p| {
-            let st = s.doc_mut()?;
-            st.editing_parents = p.get("on").and_then(Value::as_bool).unwrap_or(!st.editing_parents);
-            st.selection = Default::default();
-            st.revision += 1;
-            ok()
-        }),
+        cmd!(
+            "layout.parents.delete",
+            "Delete Parent",
+            [],
+            None,
+            "{id: parent spread id} — unapply the parent and keep local overrides as ordinary items",
+            has_doc,
+            |s, p| {
+                let id = p.get("id").and_then(Value::as_u64).map(SpreadId).ok_or_else(|| bad("layout.parents.delete", "missing parent id"))?;
+                s.edit(|d, sel| {
+                    d.delete_parent(id)?;
+                    *sel = Default::default();
+                    ok()
+                })?;
+                let st = s.doc_mut()?;
+                if st.doc.parents.is_empty() {
+                    st.editing_parents = false;
+                }
+                ok()
+            }
+        ),
+        cmd!(
+            noundo "layout.parents.edit",
+            "Edit Parents",
+            [],
+            None,
+            "{on?: bool, parent?: id|\"A-Parent\"|\"A\"} — show parent spreads on the canvas; `parent` shows that parent (and implies on). Turning on without `parent` shows the first parent",
+            has_doc,
+            |s, p| {
+                const ID: &str = "layout.parents.edit";
+                let doc = s.doc()?.doc.clone();
+                let parent = match p.get("parent") {
+                    None | Some(Value::Null) => None,
+                    v => match parent_ref(ID, &doc, v)? {
+                        Some(Some(id)) => Some(id),
+                        _ => return Err(bad(ID, "`parent` names a parent to show")),
+                    },
+                };
+                let st = s.doc_mut()?;
+                let was = st.editing_parents;
+                let on = p.get("on").and_then(Value::as_bool).unwrap_or(parent.is_some() || !was);
+                st.editing_parents = on;
+                st.selection = Default::default();
+                st.bump_revision();
+                // The parent to show: the one asked for, or the first when editing starts.
+                let index = match parent {
+                    Some(id) => doc.parent_index(id),
+                    None if !was && !doc.parents.is_empty() => Some(0),
+                    None => None,
+                };
+                let shown = index.filter(|_| on);
+                if let Some(i) = shown {
+                    s.ui_requests.push(crate::UiRequest::View { params: json!({"showSpread": designcraft_doc::SpreadRef::Parent(i)}) });
+                }
+                Ok(json!({"on": on, "parent": shown.and_then(|i| doc.parents.get(i)).map(|x| x.id.0)}))
+            }
+        ),
+        cmd!(
+            "layout.parents.options",
+            "Parent Options…",
+            [],
+            None,
+            "{parent: id|\"B-Parent\"|\"B\", basedOn: id|\"A-Parent\"|\"A\"|null (= [None])} — the parent shows its base's items under its own, and so do the pages that use it → {parent, basedOn}",
+            has_doc,
+            parent_options
+        ),
         cmd!(
             "layout.marginsAndColumns",
             "Margins and Columns…",
             ["Layout"],
             None,
-            "{pages?: [index] (default all), parent?: index (edit that parent spread instead; `pages` then index its pages), margins?: number|{top,bottom,inside,outside}, columns?, gutter?, adjustLayout?: bool (objects follow the margins)}",
+            "{pages?: [index] (default all), margins?: number|{top,bottom,inside,outside}, columns?, gutter?, adjustLayout?: bool (objects follow the margins), parent? (a parent's prefix, label or index)} — document pages take these as their own margins; with `parent` the parent's pages change instead (`pages` then indexes them), and so do the document pages without their own",
             has_doc,
             |s, p| {
                 let pages: Option<Vec<usize>> =
                     p.get("pages").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|v| v as usize).collect());
+                let parent = match p.get("parent") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(parent_spread_index(&s.doc()?.doc, v).ok_or_else(|| bad("layout.marginsAndColumns", "no such parent"))?),
+                };
                 let p = p.clone();
                 let adjust = p.get("adjustLayout").and_then(Value::as_bool).unwrap_or(false);
-                let parent = p.get("parent").and_then(Value::as_u64).map(|v| v as usize);
                 s.edit(|d, _| {
                     let before = adjust.then(|| margin_boxes(d));
                     if let Some(pi) = parent {
-                        // A parent spread: its own pages change, and so do the document pages based
-                        // on it that still have the parent's old margins and columns (not overridden).
-                        let Some(ps) = d.parents.get(pi) else {
-                            return Err(bad("layout.marginsAndColumns", format!("no parent spread {pi}")));
-                        };
-                        let idxs: Vec<usize> = pages.clone().unwrap_or_else(|| (0..ps.pages.len()).collect());
-                        let old: Vec<(usize, Margins, designcraft_doc::Columns)> =
-                            idxs.iter().filter_map(|&qi| ps.pages.get(qi).map(|pg| (qi, pg.margins, pg.columns.clone()))).collect();
-                        if let Some(ps) = d.parents.get_mut(pi) {
-                            let ps = std::sync::Arc::make_mut(ps);
-                            for &qi in &idxs {
-                                if let Some(pg) = ps.pages.get_mut(qi) {
+                        let n = d.parents.get(pi).map_or(0, |sp| sp.pages.len());
+                        let sp = d.parents.get_mut(pi).map(std::sync::Arc::make_mut);
+                        if let Some(sp) = sp {
+                            for qi in pages.clone().unwrap_or_else(|| (0..n).collect()) {
+                                if let Some(pg) = sp.pages.get_mut(qi) {
                                     set_margins_columns(pg, &p);
                                 }
                             }
                         }
-                        for abs in 0..d.page_count() {
-                            let Some((ppi, qi)) = d.parent_page_for(abs) else { continue };
-                            if ppi != pi {
-                                continue;
-                            }
-                            let Some((_, om, oc)) = old.iter().find(|o| o.0 == qi) else { continue };
-                            let Some((si, pj)) = d.page_loc(abs) else { continue };
-                            let Some(pg) = d.spreads.get_mut(si).and_then(|sp| std::sync::Arc::make_mut(sp).pages.get_mut(pj)) else { continue };
-                            if pg.margins == *om && pg.columns == *oc {
-                                set_margins_columns(pg, &p);
-                            }
-                        }
+                        d.sync_parent_margins();
                     } else {
                         let all: Vec<usize> = pages.clone().unwrap_or_else(|| (0..d.page_count()).collect());
                         for abs in all {
                             let Some((si, pi)) = d.page_loc(abs) else { continue };
-                            let Some(pg) = d.spreads.get_mut(si).and_then(|sp| std::sync::Arc::make_mut(sp).pages.get_mut(pi)) else { continue };
+                            let Some(pg) = d.spreads.get_mut(si).map(std::sync::Arc::make_mut).and_then(|sp| sp.pages.get_mut(pi)) else { continue };
                             set_margins_columns(pg, &p);
+                            pg.local_margins = true;
                         }
                     }
                     if let Some(b) = before {
@@ -317,7 +373,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Document Setup…",
             ["File"],
             Some("Cmd+Alt+P"),
-            "{width?, height?, pages?: count, startPage?: n, facingPages?, binding?: leftToRight|rightToLeft, intent?: print|web|mobile, bleed?, slug?: n | [top, bottom, inside, outside], adjustLayout?: bool (objects follow the new page size)} → the document setup",
+            "{width?, height?, pages?: count, startPage?: n, facingPages?, binding?: leftToRight|rightToLeft, intent?: print|web|mobile, margins?: n | {top, bottom, inside, outside} (every page and parent page), bleed?, slug?: n | [top, bottom, inside, outside], adjustLayout?: bool (objects follow the new page size and margins)} → the document setup (margins: the first page's)",
             has_doc,
             |s, p| {
                 let p = p.clone();
@@ -334,6 +390,24 @@ pub fn specs() -> Vec<CommandSpec> {
                     }
                 };
                 let (bleed, slug) = (edges("bleed"), edges("slug"));
+                for k in ["width", "height"] {
+                    if let Some(v) = p.get(k)
+                        && !v.as_f64().is_some_and(|x| x > 0.0 && x <= 15552.0)
+                    {
+                        return Err(bad("layout.documentSetup", format!("{k}: page size out of range (0 < size ≤ 216 in)")));
+                    }
+                }
+                let margins: Option<Margins> = match p.get("margins") {
+                    None => None,
+                    Some(Value::Number(n)) => n.as_f64().map(Margins::uniform),
+                    Some(v) => serde_json::from_value(v.clone()).ok(),
+                };
+                if margins.is_some_and(|m| ![m.top, m.bottom, m.inside, m.outside].iter().all(|v| v.is_finite() && (0.0..=15552.0).contains(v))) {
+                    return Err(bad("layout.documentSetup", "margins: 0 to 216 in"));
+                }
+                if p.get("margins").is_some() && margins.is_none() {
+                    return Err(bad("layout.documentSetup", "margins: a number or {top, bottom, inside, outside}"));
+                }
                 let intent: Option<designcraft_doc::Intent> = p.get("intent").and_then(|v| serde_json::from_value(v.clone()).ok());
                 let pages = p.get("pages").and_then(Value::as_u64).map(|n| n.clamp(1, 9999) as usize);
                 let adjust = p.get("adjustLayout").and_then(Value::as_bool).unwrap_or(false);
@@ -344,6 +418,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     }
                     if let Some(b) = p.get("binding").and_then(Value::as_str) {
                         d.settings.right_to_left_binding = b == "rightToLeft";
+                        d.order_parent_pages();
                     }
                     if let Some(b) = bleed {
                         d.settings.bleed = b;
@@ -354,7 +429,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     if let Some(i) = intent {
                         d.settings.intent = i;
                     }
-                    if let Some(n) = p.get("startPage").and_then(Value::as_u64) {
+                    if let Some(n) = p.get("startPage").map(|v| start_number("layout.documentSetup", "startPage", v)).transpose()? {
                         if !d.sections.iter().any(|x| x.start == 0) {
                             d.sections.insert(
                                 0,
@@ -369,7 +444,7 @@ pub fn specs() -> Vec<CommandSpec> {
                             );
                         }
                         if let Some(first) = d.sections.iter_mut().find(|x| x.start == 0) {
-                            first.start_number = Some(n.max(1) as u32);
+                            first.start_number = Some(n);
                         }
                     }
                     // Number of Pages: add at the end (with the last page's parent) or remove from the end.
@@ -407,6 +482,17 @@ pub fn specs() -> Vec<CommandSpec> {
                             }
                             sp.relayout();
                         }
+                    }
+                    if let Some(m) = margins {
+                        for sp in d.spreads.iter_mut().chain(d.parents.iter_mut()) {
+                            for pg in &mut std::sync::Arc::make_mut(sp).pages {
+                                pg.margins = m;
+                            }
+                        }
+                        // Pages that now match their parent page follow its later changes; local
+                        // columns stay local.
+                        d.unmark_matching_local_margins();
+                        d.sync_parent_margins();
                     }
                     d.repaginate();
                     if let Some(b) = before {
@@ -499,7 +585,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 st.selection = designcraft_doc::Selection::items(ids);
             }
             st.selection.page = page;
-            st.revision += 1;
+            st.bump_revision();
             Ok(json!({"page": page.map(|p| p + 1)}))
         }
         ),
@@ -508,67 +594,64 @@ pub fn specs() -> Vec<CommandSpec> {
             "Numbering & Section Options…",
             ["Layout"],
             None,
-            "{page (1-based; starts a section there), startNumber?: n|null (continue), style?: arabic|upperRoman|lowerRoman|upperLetters|lowerLetters, prefix?, includePrefix?, marker?, remove?: bool}",
+            "{page (1-based; starts a section there), startNumber?: n (1–99999)|null (continue), style?: arabic|upperRoman|lowerRoman|upperLetters|lowerLetters|arabicLeadingZero|arabicThreeDigits|arabicFourDigits|kanji, prefix? (up to 8 characters; no + or comma), includePrefix?, marker?, remove?: bool}",
             has_doc,
             |s, p| {
-                let page = p.get("page").and_then(Value::as_u64).ok_or_else(|| bad("layout.section", "missing page"))? as usize;
-                let n = s.doc()?.doc.page_count();
-                if page == 0 || page > n {
-                    return Err(bad("layout.section", format!("no page {page}")));
-                }
-                let start = page - 1;
-                let p = p.clone();
+                let edit = SectionEdit::parse("layout.section", s, p)?;
                 s.edit(|d, _| {
-                    // The settings the command does not name stay as the section was: read it
-                    // before the list is rebuilt (#717).
-                    let existing = d.sections.iter().find(|x| x.start == start).cloned();
-                    d.sections.retain(|x| x.start != start || start == 0);
-                    if p.get("remove").and_then(Value::as_bool).unwrap_or(false) && start != 0 {
-                        // The pages after it follow the previous section's numbers again.
-                        d.repaginate();
-                        return ok();
-                    }
-                    let mut sec = existing.unwrap_or(designcraft_doc::Section {
-                        start,
-                        start_number: None,
-                        style: Default::default(),
-                        prefix: String::new(),
-                        marker: String::new(),
-                        include_prefix: false,
-                    });
-                    match p.get("startNumber") {
-                        Some(Value::Null) => sec.start_number = None,
-                        Some(v) => sec.start_number = v.as_u64().map(|v| v.max(1) as u32),
-                        None => {}
-                    }
-                    if let Some(v) = p.get("style") {
-                        sec.style = serde_json::from_value(v.clone()).map_err(|e| bad("layout.section", e.to_string()))?;
-                    }
-                    if let Some(v) = p.get("prefix").and_then(Value::as_str) {
-                        sec.prefix = v.into();
-                    }
-                    if let Some(v) = p.get("includePrefix").and_then(Value::as_bool) {
-                        sec.include_prefix = v;
-                    }
-                    if let Some(v) = p.get("marker").and_then(Value::as_str) {
-                        sec.marker = v.into();
-                    }
-                    d.sections.retain(|x| x.start != start);
-                    d.sections.push(sec);
-                    d.sections.sort_by_key(|x| x.start);
-                    // Facing pages take their sides from their numbers: odd on the right.
-                    d.repaginate();
+                    edit.apply(d);
                     Ok(json!({"names": (0..d.page_count()).map(|i| d.page_name(i)).collect::<Vec<_>>()}))
                 })
             }
         ),
+        cmd!(
+            "layout.chapterNumbering",
+            "Document Chapter Numbering",
+            [],
+            None,
+            "{style?: arabic|upperRoman|lowerRoman|upperLetters|lowerLetters|arabicLeadingZero|arabicThreeDigits|arabicFourDigits, start?: n (Start Chapter Numbering at), source?: automatic|userDefined|sameAsPrevious} → {chapterNumber, label, style, source, book: the open book holding the document, or null}; no parameters reports the setting",
+            has_doc,
+            |s, p| {
+                if p.as_object().is_none_or(|o| o.is_empty()) {
+                    return chapter_numbering(s);
+                }
+                let edit = ChapterEdit::parse("layout.chapterNumbering", p)?;
+                s.edit(|d, _| {
+                    edit.apply(d);
+                    ok()
+                })?;
+                chapter_numbering(s)
+            }
+        ),
+        cmd!(
+            "layout.numberingOptions",
+            "Apply Numbering & Section Options",
+            [],
+            None,
+            "{page, …the settings as layout.section, chapter?: {…the settings as layout.chapterNumbering}} — the section and the document's chapter numbering in one undo step; if either is refused nothing changes",
+            has_doc,
+            |s, p| {
+                let section = SectionEdit::parse("layout.numberingOptions", s, p)?;
+                let chapter = match p.get("chapter") {
+                    Some(c) => Some(ChapterEdit::parse("layout.numberingOptions", c)?),
+                    None => None,
+                };
+                s.edit(|d, _| {
+                    section.apply(d);
+                    if let Some(chapter) = &chapter {
+                        chapter.apply(d);
+                    }
+                    Ok(json!({"names": (0..d.page_count()).map(|i| d.page_name(i)).collect::<Vec<_>>(), "chapter": d.chapter_label()}))
+                })
+            }
+        ),
         cmd!("layer.move", "Move Layer", [], None, "{id, to: index (0 = top/frontmost)}", has_doc, |s, p| {
-            let id = LayerId(p.get("id").and_then(Value::as_u64).unwrap_or(0));
-            let to = p.get("to").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let id = LayerId(p.get("id").and_then(Value::as_u64).ok_or_else(|| bad("layer.move", "missing id"))?);
+            let to = p.get("to").and_then(Value::as_u64).ok_or_else(|| bad("layer.move", "missing to"))?;
             s.edit(|d, _| {
                 let i = d.layers.iter().position(|l| l.id == id).ok_or_else(|| bad("layer.move", "no such layer"))?;
+                let to = usize::try_from(to).ok().filter(|t| *t < d.layers.len()).ok_or_else(|| bad("layer.move", "to out of range"))?;
                 let l = d.layers.remove(i);
-                let to = to.min(d.layers.len());
                 d.layers.insert(to, l);
                 ok()
             })
@@ -578,7 +661,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let st = s.doc_mut()?;
             let ids: Vec<_> = st.doc.spreads.iter().flat_map(|sp| sp.items.iter().filter(|i| i.layer == id && !i.locked).map(|i| i.id)).collect();
             st.selection = designcraft_doc::Selection::items(ids);
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
         cmd!("layer.new", "New Layer…", [], None, "{name?}", has_doc, |s, p| {
@@ -605,29 +688,15 @@ pub fn specs() -> Vec<CommandSpec> {
             s.doc_mut()?.active_layer = r;
             Ok(json!({"id": r.0}))
         }),
-        cmd!("layer.set", "Layer Options…", [], None, "{id, name?, visible?, locked?, printable?, color?: [r,g,b]}", has_doc, |s, p| {
-            let id = LayerId(p.get("id").and_then(Value::as_u64).unwrap_or(0));
-            let p = p.clone();
-            s.edit(|d, _| {
-                let l = d.layer_mut(id).ok_or_else(|| bad("layer.set", "no such layer"))?;
-                if let Some(v) = p.get("name").and_then(Value::as_str) {
-                    l.name = v.into();
-                }
-                if let Some(v) = p.get("visible").and_then(Value::as_bool) {
-                    l.visible = v;
-                }
-                if let Some(v) = p.get("locked").and_then(Value::as_bool) {
-                    l.locked = v;
-                }
-                if let Some(v) = p.get("printable").and_then(Value::as_bool) {
-                    l.printable = v;
-                }
-                if let Some(c) = p.get("color").and_then(|c| serde_json::from_value(c.clone()).ok()) {
-                    l.color = c;
-                }
-                ok()
-            })
-        }),
+        cmd!(
+            "layer.set",
+            "Layer Options…",
+            [],
+            None,
+            "{id, name?, color?: [r,g,b] | layer colour name (\"Light Blue\", \"Red\", …), visible?, locked?, printable?, showGuides?, suppressWrapWhenHidden?} — names are unique and not empty",
+            has_doc,
+            set_layer
+        ),
         cmd!("layer.delete", "Delete Layer", [], None, "{id}", has_doc, |s, p| {
             let id = LayerId(p.get("id").and_then(Value::as_u64).unwrap_or(0));
             s.edit(|d, sel| {
@@ -733,20 +802,75 @@ pub fn specs() -> Vec<CommandSpec> {
                 return Err(bad("layer.activate", "no such layer"));
             }
             st.active_layer = id;
-            st.revision += 1;
+            st.bump_revision();
             ok()
         }),
     ]
 }
 
-/// `"A"` → that parent's id; `null` → Some(None) (= [None]); missing → None (use default).
-fn parent_ref(d: &designcraft_doc::Document, v: Option<&Value>) -> Option<Option<SpreadId>> {
-    match v? {
-        Value::Null => Some(None),
-        Value::String(s) if s == "[None]" => Some(None),
-        Value::String(s) => Some(d.parents.iter().find(|p| p.parent.as_ref().is_some_and(|i| i.prefix == *s || i.label() == *s)).map(|p| p.id)),
+/// A parent spread named by prefix, label (`A-Parent`) or index.
+fn parent_spread_index(d: &designcraft_doc::Document, v: &Value) -> Option<usize> {
+    match v {
+        Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()).filter(|i| *i < d.parents.len()),
+        Value::String(s) => d.parents.iter().position(|p| p.parent.as_ref().is_some_and(|i| i.prefix == *s || i.label() == *s)),
         _ => None,
     }
+}
+
+/// A parent named by a command parameter: its id (a number), its full label (`"A-Parent"`), or
+/// its prefix (`"A"`) when only one parent has it. `null` or `"[None]"` → `Some(None)` (no parent);
+/// missing → `None` (the command's default). Unknown or ambiguous names are errors, so a typo never
+/// clears a page's parent.
+fn parent_ref(cmd: &str, d: &designcraft_doc::Document, v: Option<&Value>) -> Result<Option<Option<SpreadId>>> {
+    let Some(v) = v else { return Ok(None) };
+    match v {
+        Value::Null => Ok(Some(None)),
+        Value::String(s) if s == "[None]" => Ok(Some(None)),
+        Value::Number(n) => {
+            let id = n.as_u64().ok_or_else(|| bad(cmd, format!("no parent with id {n}")))?;
+            d.parents.iter().find(|p| p.id.0 == id).map(|p| Some(Some(p.id))).ok_or_else(|| bad(cmd, format!("no parent with id {id}")))
+        }
+        Value::String(s) => {
+            let by = |f: &dyn Fn(&designcraft_doc::ParentInfo) -> bool| -> Vec<SpreadId> {
+                d.parents.iter().filter(|p| p.parent.as_ref().is_some_and(f)).map(|p| p.id).collect()
+            };
+            let mut hits = by(&|i| i.label() == *s);
+            if hits.is_empty() {
+                hits = by(&|i| i.prefix == *s);
+            }
+            match hits.as_slice() {
+                [id] => Ok(Some(Some(*id))),
+                [] => Err(bad(cmd, format!("no parent named `{s}`"))),
+                _ => Err(bad(cmd, format!("more than one parent is named `{s}`: give its id"))),
+            }
+        }
+        _ => Err(bad(cmd, "`parent` is a parent id, a parent name or null")),
+    }
+}
+
+/// Layout › Pages › Parent Options: Based on Parent. A base that would make a cycle is refused.
+fn parent_options(s: &mut crate::Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "layout.parents.options";
+    let d = &s.doc()?.doc;
+    let Some(Some(id)) = parent_ref(CMD, d, p.get("parent"))? else { return Err(bad(CMD, "`parent` names the parent to change")) };
+    let pi = d.parent_index(id).ok_or_else(|| bad(CMD, format!("no parent with id {}", id.0)))?;
+    let base = parent_ref(CMD, d, p.get("basedOn"))?.ok_or_else(|| bad(CMD, "missing `basedOn` (a parent, or null for [None])"))?;
+    let label = |d: &designcraft_doc::Document, i: usize| d.parents.get(i).and_then(|x| x.parent.as_ref()).map(|i| i.label());
+    if let Some(b) = base
+        && d.parent_base_cycles(pi, b)
+    {
+        let (name, b) = (label(d, pi).unwrap_or_default(), d.parent_index(b).and_then(|i| label(d, i)).unwrap_or_default());
+        return Err(bad(CMD, format!("{name} cannot be based on {b}: that would make a cycle")));
+    }
+    let out = json!({"parent": label(d, pi), "basedOn": base.and_then(|b| d.parent_index(b)).and_then(|i| label(d, i))});
+    if d.parents.get(pi).and_then(|x| x.parent.as_ref()).and_then(|i| i.based_on) == base {
+        return Ok(out);
+    }
+    s.edit(|d, _| {
+        let info = d.parents.get_mut(pi).map(std::sync::Arc::make_mut).and_then(|x| x.parent.as_mut()).ok_or_else(|| bad(CMD, "no such parent"))?;
+        info.based_on = base;
+        Ok(out)
+    })
 }
 
 #[allow(dead_code)]
@@ -894,12 +1018,276 @@ fn document_setup(d: &designcraft_doc::Document) -> Value {
     let st = &d.settings;
     let start = d.sections.iter().find(|x| x.start == 0).and_then(|x| x.start_number).unwrap_or(1);
     json!({"width": st.page_width, "height": st.page_height, "pages": d.page_count(), "startPage": start, "facingPages": st.facing_pages,
-        "binding": if st.right_to_left_binding { "rightToLeft" } else { "leftToRight" }, "intent": st.intent, "bleed": st.bleed, "slug": st.slug})
+        "binding": if st.right_to_left_binding { "rightToLeft" } else { "leftToRight" }, "intent": st.intent, "bleed": st.bleed, "slug": st.slug,
+        "margins": d.page(0).map(|p| p.margins), "primaryTextFrame": st.primary_text_frame})
+}
+
+/// The largest chapter number (as for page numbers).
+const MAX_CHAPTER: u64 = designcraft_doc::MAX_PAGE_NUMBER as u64;
+
+/// A `layout.section` edit, checked before the document changes.
+struct SectionEdit {
+    /// Absolute index of the section's first page.
+    start: usize,
+    remove: bool,
+    /// Some(None): continue from the previous section.
+    start_number: Option<Option<u32>>,
+    style: Option<designcraft_doc::NumberStyle>,
+    prefix: Option<String>,
+    include_prefix: Option<bool>,
+    marker: Option<String>,
+}
+
+impl SectionEdit {
+    fn parse(cmd: &str, s: &Session, p: &Value) -> Result<Self> {
+        let page = p.get("page").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "missing page"))?;
+        let n = s.doc()?.doc.page_count() as u64;
+        if page == 0 || page > n {
+            return Err(bad(cmd, format!("no page {page}")));
+        }
+        let prefix = p.get("prefix").and_then(Value::as_str).map(str::to_string);
+        if prefix.as_ref().is_some_and(|x| x.chars().count() > 8 || x.contains(['+', ','])) {
+            return Err(bad(cmd, "section prefix: up to 8 characters, without + or ,"));
+        }
+        let start_number = match p.get("startNumber") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(v) => Some(Some(start_number(cmd, "startNumber", v)?)),
+        };
+        let style = match p.get("style") {
+            None => None,
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(designcraft_doc::NumberStyle::Symbols) => return Err(bad(cmd, "symbols don't number pages")),
+                Ok(style) => Some(style),
+                Err(e) => return Err(bad(cmd, e.to_string())),
+            },
+        };
+        Ok(SectionEdit {
+            start: (page - 1) as usize,
+            remove: p.get("remove").and_then(Value::as_bool).unwrap_or(false),
+            start_number,
+            style,
+            prefix,
+            include_prefix: p.get("includePrefix").and_then(Value::as_bool),
+            marker: p.get("marker").and_then(Value::as_str).map(str::to_string),
+        })
+    }
+
+    fn apply(&self, d: &mut designcraft_doc::Document) {
+        let start = self.start;
+        // Page 1 always starts a section.
+        if self.remove && start != 0 {
+            d.sections.retain(|x| x.start != start);
+            // The pages after it follow the previous section's numbers again.
+            d.repaginate();
+            return;
+        }
+        let mut sec = d.sections.iter().find(|x| x.start == start).cloned().unwrap_or(designcraft_doc::Section {
+            start,
+            start_number: None,
+            style: Default::default(),
+            prefix: String::new(),
+            marker: String::new(),
+            include_prefix: false,
+        });
+        if let Some(n) = self.start_number {
+            sec.start_number = n;
+        }
+        if let Some(style) = self.style {
+            sec.style = style;
+        }
+        if let Some(prefix) = &self.prefix {
+            sec.prefix = prefix.clone();
+        }
+        if let Some(on) = self.include_prefix {
+            sec.include_prefix = on;
+        }
+        if let Some(marker) = &self.marker {
+            sec.marker = marker.clone();
+        }
+        d.sections.retain(|x| x.start != start);
+        d.sections.push(sec);
+        d.sections.sort_by_key(|x| x.start);
+        // Facing pages take their sides from their numbers: odd on the right.
+        d.repaginate();
+    }
+}
+
+/// A `layout.chapterNumbering` edit, checked before the document changes.
+struct ChapterEdit {
+    style: Option<designcraft_doc::NumberStyle>,
+    source: Option<designcraft_doc::ChapterSource>,
+    start: Option<u32>,
+}
+
+impl ChapterEdit {
+    fn parse(cmd: &str, p: &Value) -> Result<Self> {
+        let style = match p.get("style") {
+            Some(v) => match serde_json::from_value::<designcraft_doc::NumberStyle>(v.clone()) {
+                Ok(designcraft_doc::NumberStyle::Symbols) | Err(_) => return Err(bad(cmd, format!("unknown chapter style {v}"))),
+                Ok(style) => Some(style),
+            },
+            None => None,
+        };
+        let mut source = match p.get("source") {
+            Some(v) => Some(
+                serde_json::from_value::<designcraft_doc::ChapterSource>(v.clone())
+                    .map_err(|_| bad(cmd, format!("unknown chapter number source {v}")))?,
+            ),
+            None => None,
+        };
+        let start = match p.get("start") {
+            Some(v) => {
+                Some(v.as_u64().filter(|n| (1..=MAX_CHAPTER).contains(n)).ok_or_else(|| bad(cmd, format!("chapter start: 1 to {MAX_CHAPTER}")))?
+                    as u32)
+            }
+            None => None,
+        };
+        // A start number alone means Start Chapter Numbering at.
+        if start.is_some() && source.is_none() {
+            source = Some(designcraft_doc::ChapterSource::UserDefined);
+        }
+        Ok(ChapterEdit { style, source, start })
+    }
+
+    fn apply(&self, d: &mut designcraft_doc::Document) {
+        if let Some(style) = self.style {
+            d.settings.chapter_style = style;
+        }
+        if let Some(source) = self.source {
+            d.settings.chapter_source = source;
+        }
+        if let Some(n) = self.start {
+            d.settings.chapter_number = n;
+        }
+    }
+}
+
+/// The active document's chapter numbering, and the open book that holds it (what
+/// `layout.chapterNumbering {}` reports, read without running a command).
+pub fn chapter_numbering(s: &Session) -> Result<Value> {
+    let st = s.doc()?;
+    let set = &st.doc.settings;
+    let book = s
+        .book
+        .as_ref()
+        .filter(|b| st.path.as_deref().is_some_and(|p| b.documents.iter().any(|d| std::path::Path::new(d) == std::path::Path::new(p))))
+        .map(|b| std::path::Path::new(&b.path).file_stem().map_or_else(|| b.path.clone(), |n| n.to_string_lossy().to_string()));
+    Ok(
+        json!({"chapterNumber": set.chapter_number.max(1), "label": st.doc.chapter_label(), "style": set.chapter_style, "source": set.chapter_source, "book": book}),
+    )
+}
+
+/// Layer Options: every field in one undo step; a bad name or colour changes nothing.
+fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "layer.set";
+    let id = LayerId(p.get("id").and_then(Value::as_u64).ok_or_else(|| bad(ID, "missing id"))?);
+    let name = match p.get("name") {
+        Some(v) => Some(v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(ID, "a layer needs a name"))?.to_string()),
+        None => None,
+    };
+    let color: Option<[u8; 3]> = match p.get("color") {
+        None => None,
+        Some(Value::String(n)) => Some(
+            LAYER_COLORS
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, c)| *c)
+                .ok_or_else(|| bad(ID, format!("unknown layer colour `{n}`")))?,
+        ),
+        Some(v) => Some(serde_json::from_value(v.clone()).map_err(|_| bad(ID, "color is [r,g,b] (0–255) or a layer colour name"))?),
+    };
+    let flag = |k: &str| match p.get(k) {
+        None => Ok(None),
+        Some(v) => v.as_bool().map(Some).ok_or_else(|| bad(ID, format!("`{k}` is true or false"))),
+    };
+    let (visible, locked, printable) = (flag("visible")?, flag("locked")?, flag("printable")?);
+    let (guides, wrap) = (flag("showGuides")?, flag("suppressWrapWhenHidden")?);
+    s.edit(|d, _| {
+        if let Some(n) = &name
+            && d.layers.iter().any(|l| l.id != id && l.name == *n)
+        {
+            return Err(bad(ID, format!("a layer named `{n}` exists")));
+        }
+        let l = d.layer_mut(id).ok_or_else(|| bad(ID, "no such layer"))?;
+        if let Some(n) = name {
+            l.name = n;
+        }
+        if let Some(c) = color {
+            l.color = c;
+        }
+        for (slot, v) in [
+            (&mut l.visible, visible),
+            (&mut l.locked, locked),
+            (&mut l.printable, printable),
+            (&mut l.show_guides, guides),
+            (&mut l.suppress_wrap_when_hidden, wrap),
+        ] {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        }
+        ok()
+    })
 }
 
 #[cfg(test)]
 mod setup_tests {
     use serde_json::json;
+
+    #[test]
+    fn chapter_numbering_sets_style_and_start() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("layout.chapterNumbering", &json!({})).unwrap();
+        assert_eq!(r, json!({"chapterNumber": 1, "label": "1", "style": "arabic", "source": "automatic", "book": null}));
+        let r = s.execute("layout.chapterNumbering", &json!({"start": 4, "style": "upperRoman"})).unwrap();
+        assert_eq!((&r["label"], &r["source"]), (&json!("IV"), &json!("userDefined")), "a start number means Start Chapter Numbering at");
+        s.execute("variables.define", &json!({"name": "Chapter", "type": "chapterNumber"})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let chapter = d.variable("Chapter").unwrap();
+        assert_eq!(d.variable_value(chapter, Some(0)).as_deref(), Some("IV"), "the Chapter Number variable uses the style");
+        for bad in [json!({"style": "symbols"}), json!({"start": 0}), json!({"start": 100_000}), json!({"source": "nextBook"})] {
+            assert!(s.execute("layout.chapterNumbering", &bad).is_err(), "{bad}");
+        }
+        s.execute("layout.chapterNumbering", &json!({"source": "sameAsPrevious"})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.execute("layout.chapterNumbering", &json!({})).unwrap()["source"], "userDefined", "undoable");
+    }
+
+    #[test]
+    fn document_setup_sets_every_pages_margins_in_one_step() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 3, "margins": 36})).unwrap();
+        let f = s.execute("frame.create", &json!({"rect": [36, 36, 576, 756], "content": "text"})).unwrap();
+        let r = s.execute("layout.documentSetup", &json!({})).unwrap();
+        assert_eq!(r["margins"], json!({"top": 36.0, "bottom": 36.0, "inside": 36.0, "outside": 36.0}));
+        let m = json!({"top": 72, "bottom": 54, "inside": 72, "outside": 72});
+        let r = s.execute("layout.documentSetup", &json!({"margins": m, "bleed": 9, "adjustLayout": true})).unwrap();
+        assert_eq!(r["margins"]["bottom"], 54.0);
+        let d = &s.doc().unwrap().doc;
+        assert!(
+            d.spreads.iter().chain(&d.parents).flat_map(|sp| &sp.pages).all(|pg| pg.margins.top == 72.0 && pg.margins.bottom == 54.0),
+            "every page and parent page"
+        );
+        let b = d.item(designcraft_doc::ItemId(f["id"].as_u64().unwrap())).unwrap().bounds();
+        assert!((b.y0 - 72.0).abs() < 1e-6, "Adjust Layout: the frame follows the margins ({b:?})");
+        // One step: undo brings back the margins and the bleed.
+        s.execute("edit.undo", &json!({})).unwrap();
+        let r = s.execute("layout.documentSetup", &json!({})).unwrap();
+        assert_eq!((r["margins"]["top"].clone(), r["bleed"][0].clone()), (json!(36.0), json!(0.0)));
+        for bad in [
+            json!({"width": 0}),
+            json!({"height": -5}),
+            json!({"width": 1e9}),
+            json!({"width": "wide"}),
+            json!({"margins": -1}),
+            json!({"margins": {"top": 1}}),
+        ] {
+            assert!(s.execute("layout.documentSetup", &bad).is_err(), "{bad}");
+        }
+        assert_eq!(s.execute("layout.documentSetup", &json!({})).unwrap()["width"], 612.0, "refused values change nothing");
+    }
 
     #[test]
     fn document_setup_pages_start_bleed_slug() {
@@ -949,6 +1337,38 @@ mod setup_tests {
         assert_eq!(d.spreads[1].pages.iter().map(|p| (p.side, p.x)).collect::<Vec<_>>(), vec![(Left, 0.0), (Right, w)]);
     }
 
+    /// Bound right to left, a parent spread lists its right page first; each document page still
+    /// shows the parent page on its own side, at its own position, also after an IDML round trip.
+    #[test]
+    fn right_to_left_binding_shows_the_parent_page_of_the_same_side() {
+        use designcraft_doc::PageSide::{Left, Right};
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 4})).unwrap();
+        s.execute("layout.documentSetup", &json!({"binding": "rightToLeft"})).unwrap();
+        let w = s.doc().unwrap().doc.settings.page_width;
+        let parent = json!({"kind": "parent", "index": 0});
+        for (rect, text) in [(json!([72, 36, 200, 60]), "left head"), (json!([w + 72.0, 36, w + 200.0, 60]), "right head")] {
+            s.execute("frame.create", &json!({"spread": parent, "rect": rect, "content": "text", "text": text})).unwrap();
+        }
+        let d = s.doc().unwrap().doc.clone();
+        assert_eq!(d.parents[0].pages.iter().map(|p| (p.side, p.x)).collect::<Vec<_>>(), vec![(Right, w), (Left, 0.0)]);
+        let docs = [(*d).clone(), designcraft_idml::import_idml(&designcraft_idml::export_idml(&d)).unwrap()];
+        for d in docs {
+            let mut s = crate::Session::new();
+            s.add_document(crate::DocState::new(d, None));
+            for (page, side, text) in [(0, Left, "left head"), (1, Right, "right head"), (2, Left, "left head"), (3, Right, "right head")] {
+                let r = s.execute("layout.overrideParentItems", &json!({"page": page})).unwrap();
+                let d = &s.doc().unwrap().doc;
+                let ids = r["ids"].as_array().unwrap();
+                assert_eq!(ids.len(), 1, "page {}", page + 1);
+                let it = d.item(designcraft_doc::ItemId(ids[0].as_u64().unwrap())).unwrap();
+                let story = d.story(it.text_frame().unwrap().story).unwrap();
+                assert_eq!((d.page(page).unwrap().side, story.text.trim_end()), (side, text), "page {}", page + 1);
+                assert_eq!(d.page_of_item(it.id), Some(page), "page {}", page + 1);
+            }
+        }
+    }
+
     /// Multi-column frames filled the left column first in a right-to-left document (#100):
     /// stories made in a right-to-left-bound document start their columns on the right.
     #[test]
@@ -982,6 +1402,22 @@ mod setup_tests {
 #[cfg(test)]
 mod layer_tests {
     use serde_json::json;
+
+    #[test]
+    fn layer_move_reorders_and_rejects_bad_input() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let l1 = s.doc().unwrap().doc.layers[0].id.0;
+        let l2 = s.execute("layer.new", &json!({})).unwrap()["id"].as_u64().unwrap();
+        let order = |s: &crate::Session| s.doc().unwrap().doc.layers.iter().map(|l| l.id.0).collect::<Vec<_>>();
+        assert_eq!(order(&s), [l2, l1]);
+        for bad in [json!({"id": l1, "to": 2}), json!({"id": 999, "to": 0}), json!({"id": l1}), json!({"to": 0})] {
+            assert!(s.execute("layer.move", &bad).is_err(), "{bad}");
+            assert_eq!(order(&s), [l2, l1]);
+        }
+        s.execute("layer.move", &json!({"id": l1, "to": 0})).unwrap();
+        assert_eq!(order(&s), [l1, l2]);
+    }
 
     #[test]
     fn merge_delete_unused_hide_and_lock_others() {
@@ -1085,6 +1521,67 @@ mod page_numbering_view_tests {
         assert_eq!(s.resolve_page("9"), None);
     }
 
+    #[test]
+    fn section_start_numbers_are_bounded() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2})).unwrap();
+        for n in [json!(0), json!(100_000), json!(u32::MAX), json!(u64::from(u32::MAX) + 2), json!(-1), json!(2.5), json!("7")] {
+            let e = s.execute("layout.section", &json!({"page": 1, "startNumber": n})).unwrap_err().to_string();
+            assert!(e.contains("startNumber"), "{n}: {e}");
+            assert!(s.execute("layout.documentSetup", &json!({"startPage": n})).is_err(), "{n}");
+        }
+        assert_eq!((0..2).map(|i| s.page_label(i)).collect::<Vec<_>>(), ["1", "2"]);
+        let r = s.execute("layout.section", &json!({"page": 1, "startNumber": 99_999})).unwrap();
+        assert_eq!(r["names"], json!(["99999", "100000"]));
+    }
+
+    #[test]
+    fn numbering_options_apply_in_one_undo_step_or_not_at_all() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 4})).unwrap();
+        let names = |s: &crate::Session| (0..4).map(|i| s.doc().unwrap().doc.page_name(i)).collect::<Vec<_>>();
+        let r = s
+            .execute(
+                "layout.numberingOptions",
+                &json!({"page": 3, "startNumber": 5, "style": "lowerRoman", "prefix": "A-", "includePrefix": true, "chapter": {"start": 4, "style": "upperRoman"}}),
+            )
+            .unwrap();
+        assert_eq!((r["names"].clone(), r["chapter"].clone()), (json!(["1", "2", "A-v", "A-vi"]), json!("IV")));
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(names(&s), ["1", "2", "3", "4"], "one undo reverts the section…");
+        assert_eq!(s.doc().unwrap().doc.chapter_label(), "1", "…and the chapter numbering");
+        // A refused part leaves the other undone too.
+        for bad in [
+            json!({"page": 3, "startNumber": 5, "chapter": {"start": 100_000}}),
+            json!({"page": 3, "startNumber": 4_294_967_295u64, "chapter": {"start": 2}}),
+            json!({"page": 3, "prefix": "A+B", "chapter": {"start": 2}}),
+            json!({"page": 9, "chapter": {"start": 2}}),
+        ] {
+            assert!(s.execute("layout.numberingOptions", &bad).is_err(), "{bad}");
+            assert_eq!(names(&s), ["1", "2", "3", "4"], "{bad}");
+            assert_eq!(s.doc().unwrap().doc.settings.chapter_source, designcraft_doc::ChapterSource::Automatic, "{bad}");
+        }
+        // Removing a section keeps the chapter part.
+        s.execute("layout.section", &json!({"page": 3, "startNumber": 1})).unwrap();
+        s.execute("layout.numberingOptions", &json!({"page": 3, "remove": true, "chapter": {"source": "userDefined", "start": 2}})).unwrap();
+        assert_eq!(names(&s), ["1", "2", "3", "4"]);
+        assert_eq!(s.doc().unwrap().doc.chapter_label(), "2");
+    }
+
+    #[test]
+    fn section_prefixes_are_short_and_avoid_plus_and_comma() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 2})).unwrap();
+        for prefix in ["A-", "Appendix", "§ 1"] {
+            s.execute("layout.section", &json!({"page": 2, "prefix": prefix})).unwrap();
+        }
+        for prefix in ["Appendix1", "A+", "1,2"] {
+            assert!(s.execute("layout.section", &json!({"page": 2, "prefix": prefix})).is_err(), "{prefix}");
+        }
+        assert!(s.execute("layout.section", &json!({"page": 2, "style": "symbols"})).is_err());
+        assert_eq!(s.doc().unwrap().doc.sections.iter().find(|x| x.start == 1).unwrap().prefix, "§ 1", "a refused prefix changes nothing");
+    }
+
     /// `layout.section` edits one named setting; the others stay as the section was (#717).
     #[test]
     fn updating_a_section_keeps_settings_the_command_does_not_name() {
@@ -1146,7 +1643,7 @@ mod adjust_tests {
         // The parent page itself changed (this is what was drawn on screen).
         assert_eq!(d.parents[0].pages[0].margins, Margins::uniform(60.0));
         assert_eq!(d.parents[0].pages[0].columns.count, 2);
-        // Pages that matched the parent follow; the overridden page keeps its margins.
+        // Pages without their own margins follow; the page given its own keeps them.
         assert_eq!(d.page(0).unwrap().margins, Margins::uniform(60.0));
         assert_eq!(d.page(1).unwrap().margins, Margins::uniform(60.0));
         assert_eq!(d.page(2).unwrap().margins, Margins::uniform(100.0));
@@ -1264,3 +1761,297 @@ mod spread_rotation_input_tests {
         assert_eq!(rotation(&s), 0, "zero resets the spread view");
     }
 }
+
+#[cfg(test)]
+mod layer_options_tests {
+    use serde_json::json;
+
+    #[test]
+    fn layer_set_sets_every_field_and_rejects_bad_names() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let first = s.doc().unwrap().doc.layers[0].id.0;
+        let id = s.execute("layer.new", &json!({"name": "Art"})).unwrap()["id"].as_u64().unwrap();
+        let all = json!({"id": id, "name": "  Artwork ", "color": "Gold", "visible": false, "locked": true, "printable": false,
+            "showGuides": false, "suppressWrapWhenHidden": true});
+        s.execute("layer.set", &all).unwrap();
+        let l = s.doc().unwrap().doc.layer(designcraft_doc::LayerId(id)).cloned().unwrap();
+        assert_eq!(l.name, "Artwork");
+        assert_eq!(l.color, [255, 153, 0]);
+        assert!(!l.visible && l.locked && !l.printable && !l.show_guides && l.suppress_wrap_when_hidden);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.layer(designcraft_doc::LayerId(id)).unwrap().name, "Art", "one undo step");
+        let first_name = s.doc().unwrap().doc.layers.iter().find(|l| l.id.0 == first).unwrap().name.clone();
+        let before = s.doc().unwrap().doc.layers.clone();
+        for p in [
+            json!({"id": id, "name": ""}),
+            json!({"id": id, "name": "   "}),
+            json!({"id": id, "name": first_name}),
+            json!({"id": id, "name": "Fine", "color": "Plaid"}),
+            json!({"id": id, "color": [300, 0, 0]}),
+            json!({"id": id, "visible": "yes"}),
+            json!({"id": 999_999, "name": "Ghost"}),
+        ] {
+            assert!(s.execute("layer.set", &p).is_err(), "{p}");
+        }
+        assert_eq!(s.doc().unwrap().doc.layers, before);
+        // Keeping its own name is fine.
+        s.execute("layer.set", &json!({"id": id, "name": "Art", "color": [1, 2, 3]})).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parent_margin_tests {
+    use designcraft_doc::{Document, Margins};
+    use serde_json::json;
+
+    use crate::Session;
+
+    fn margins(d: &Document) -> Vec<(Margins, u32, bool)> {
+        (0..d.page_count()).filter_map(|i| d.page(i)).map(|p| (p.margins, p.columns.count, p.local_margins)).collect()
+    }
+
+    #[test]
+    fn document_setup_margins_let_pages_follow_their_parent_page_again() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3})).unwrap();
+        s.execute("layout.marginsAndColumns", &json!({"pages": [1], "margins": 100})).unwrap();
+        s.execute("layout.marginsAndColumns", &json!({"pages": [2], "margins": 100, "columns": 3})).unwrap();
+        s.execute("layout.documentSetup", &json!({"margins": 20})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        let twenty = Margins::uniform(20.0);
+        assert_eq!(m, vec![(twenty, 1, false), (twenty, 1, false), (twenty, 3, true)], "own columns stay local");
+        s.execute("layout.marginsAndColumns", &json!({"parent": "A", "margins": 50})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m[1], (Margins::uniform(50.0), 1, false), "page 2 follows the parent page again");
+        assert_eq!(m[2], (twenty, 3, true));
+    }
+
+    #[test]
+    fn pages_follow_their_parent_pages_margins_unless_set_locally() {
+        let mut s = Session::new();
+        // Facing: [1] [2 3]; page 3 gets its own margins.
+        s.execute("file.new", &json!({"pages": 3})).unwrap();
+        s.execute("layout.marginsAndColumns", &json!({"pages": [2], "margins": 100})).unwrap();
+        // A's left page: only the left document page follows.
+        let left = json!({"top": 10, "bottom": 20, "inside": 30, "outside": 40});
+        s.execute("layout.marginsAndColumns", &json!({"parent": "A", "pages": [0], "margins": left, "columns": 2})).unwrap();
+        let l = Margins { top: 10.0, bottom: 20.0, inside: 30.0, outside: 40.0 };
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m, vec![(Margins::uniform(36.0), 1, false), (l, 2, false), (Margins::uniform(100.0), 1, true)]);
+        // A's right page: page 1 follows, page 3 keeps its own.
+        s.execute("layout.marginsAndColumns", &json!({"parent": "A-Parent", "pages": [1], "margins": 50})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m, vec![(Margins::uniform(50.0), 1, false), (l, 2, false), (Margins::uniform(100.0), 1, true)]);
+        // A page inserted after page 1 pushes page 2 to the right: it takes the right parent page's.
+        s.execute("layout.pages.insert", &json!({"after": 0, "count": 1, "parent": "A"})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m[1], (l, 2, false), "the new left page");
+        assert_eq!(m[2], (Margins::uniform(50.0), 1, false), "old page 2, now a right page");
+        assert_eq!(m[3], (Margins::uniform(100.0), 1, true));
+        assert!(s.execute("layout.marginsAndColumns", &json!({"parent": "Z", "margins": 10})).is_err());
+    }
+
+    #[test]
+    fn applying_a_parent_gives_its_margins_and_local_margins_stay_local() {
+        let mut s = Session::new();
+        // Facing: [1] [2 3].
+        s.execute("file.new", &json!({"pages": 3})).unwrap();
+        s.execute("layout.parents.new", &json!({"prefix": "B"})).unwrap();
+        s.execute("layout.marginsAndColumns", &json!({"parent": "B", "margins": 70, "columns": 3})).unwrap();
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "B"})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m[1], (Margins::uniform(70.0), 3, false), "the page takes B's margins");
+        // Page 3 is given margins equal to A's: they are its own all the same.
+        s.execute("layout.marginsAndColumns", &json!({"pages": [2], "margins": 36})).unwrap();
+        s.execute("layout.marginsAndColumns", &json!({"parent": "A", "margins": 20})).unwrap();
+        let m = margins(&s.doc().unwrap().doc);
+        assert_eq!(m[0], (Margins::uniform(20.0), 1, false));
+        assert_eq!(m[1], (Margins::uniform(70.0), 3, false), "B's page is not A's");
+        assert_eq!(m[2], (Margins::uniform(36.0), 1, true));
+        // Back to A: page 2 follows A again.
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "A"})).unwrap();
+        assert_eq!(margins(&s.doc().unwrap().doc)[1], (Margins::uniform(20.0), 1, false));
+    }
+
+    #[test]
+    fn parent_guides_show_on_pages_but_stay_on_the_parent() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2})).unwrap();
+        // A vertical guide 100 pt into A's right page (x = 612 in the parent spread).
+        s.execute("guide.add", &json!({"spread": {"kind": "parent", "index": 0}, "page": 1, "orientation": "vertical", "position": 712})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let right = d.page(0).unwrap();
+        let shown: Vec<f64> = d.parent_guides(right).map(|g| g.position).collect();
+        assert_eq!(shown, vec![100.0], "moved to the document page's place");
+        assert_eq!(d.parent_guides(d.page(1).unwrap()).count(), 0, "the left page shows A's left page's guides");
+        // Not the document page's own: not listed, moved or deleted from there.
+        assert_eq!(s.execute("guide.list", &json!({"spread": 0})).unwrap(), json!([]));
+        assert!(s.execute("guide.move", &json!({"spread": 0, "page": 0, "index": 0, "position": 50})).is_err());
+        assert!(s.execute("guide.delete", &json!({"spread": 0, "page": 0, "index": 0})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use serde_json::json;
+
+    fn parent_of(s: &crate::Session, page: usize) -> Option<u64> {
+        s.doc().unwrap().doc.page(page).unwrap().parent.map(|p| p.0)
+    }
+
+    #[test]
+    fn parents_with_one_prefix_stay_distinct() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 2})).unwrap();
+        let a = s.execute("layout.parents.new", &json!({"prefix": "IMG", "name": "Parent"})).unwrap()["id"].as_u64().unwrap();
+        let b = s.execute("layout.parents.new", &json!({"prefix": "IMG", "name": "Half"})).unwrap()["id"].as_u64().unwrap();
+        s.execute("layout.pages.applyParent", &json!({"pages": [0], "parent": b})).unwrap();
+        assert_eq!(parent_of(&s, 0), Some(b));
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "IMG-Half"})).unwrap();
+        assert_eq!(parent_of(&s, 1), Some(b));
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "IMG-Parent"})).unwrap();
+        assert_eq!(parent_of(&s, 1), Some(a));
+        // A prefix two parents share, or a name no parent has, is an error and changes nothing.
+        assert!(s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "IMG"})).is_err());
+        assert!(s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "Nope"})).is_err());
+        assert!(s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": 999_999})).is_err());
+        assert_eq!(parent_of(&s, 1), Some(a));
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "[None]"})).unwrap();
+        assert_eq!(parent_of(&s, 1), None);
+    }
+
+    #[test]
+    fn edit_parents_shows_the_named_parent() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let ids: Vec<u64> =
+            ["B", "C", "D"].iter().map(|p| s.execute("layout.parents.new", &json!({"prefix": p})).unwrap()["id"].as_u64().unwrap()).collect();
+        s.ui_requests.clear();
+        let r = s.execute("layout.parents.edit", &json!({"parent": ids[2]})).unwrap();
+        assert_eq!(r, json!({"on": true, "parent": ids[2]}));
+        assert!(s.doc().unwrap().editing_parents);
+        let n = s.doc().unwrap().doc.parent_index(designcraft_doc::SpreadId(ids[2])).unwrap();
+        let shown: Vec<_> = s
+            .ui_requests
+            .iter()
+            .filter_map(|r| match r {
+                crate::UiRequest::View { params } => params.get("showSpread").cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, vec![json!({"kind": "parent", "index": n})]);
+        let r = s.execute("layout.parents.edit", &json!({"on": true, "parent": "C-Parent"})).unwrap();
+        assert_eq!(r["parent"], ids[1]);
+        assert!(s.execute("layout.parents.edit", &json!({"parent": "Z-Parent"})).is_err());
+        let r = s.execute("layout.parents.edit", &json!({"on": false})).unwrap();
+        assert_eq!(r, json!({"on": false, "parent": null}));
+        assert!(!s.doc().unwrap().editing_parents);
+    }
+}
+
+#[cfg(test)]
+mod parent_base_tests {
+    use serde_json::{Value, json};
+
+    fn rect(s: &mut crate::Session, spread: Value, r: [f64; 4], swatch: &str) -> u64 {
+        let id = s.execute("frame.create", &json!({"spread": spread, "rect": r, "content": "unassigned"})).unwrap()["id"].as_u64().unwrap();
+        s.execute("object.fill", &json!({"ids": [id], "swatch": swatch})).unwrap();
+        id
+    }
+
+    fn page(s: &crate::Session, abs: usize) -> designcraft_render::Rendered {
+        let mut rr = designcraft_render::Renderer::new();
+        rr.threads = 0;
+        rr.render_page(&s.doc().unwrap().doc, &s.cache, abs, 1.0, false, &Default::default()).unwrap()
+    }
+
+    /// Parent A (black), parent B based on A (cyan, half over A's square), and a page item (paper)
+    /// over B's: the page draws A, then B, then its own items.
+    #[test]
+    fn based_on_parent_draws_base_items_under_parent_items() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"width": 400, "height": 400, "pages": 2, "facingPages": false, "margins": 0})).unwrap();
+        s.execute("layout.parents.new", &json!({"prefix": "B", "name": "Opening"})).unwrap();
+        rect(&mut s, json!({"kind": "parent", "index": 0}), [0.0, 0.0, 200.0, 200.0], "[Black]");
+        rect(&mut s, json!({"kind": "parent", "index": 1}), [100.0, 0.0, 300.0, 200.0], "C=100 M=0 Y=0 K=0");
+        rect(&mut s, json!(1), [150.0, 0.0, 190.0, 40.0], "[Paper]");
+        s.execute("layout.pages.applyParent", &json!({"pages": [1], "parent": "B"})).unwrap();
+        let black = |p: [u8; 4]| p[0] < 80 && p[1] < 80 && p[2] < 80;
+        let cyan = |p: [u8; 4]| p[0] < 80 && p[1] > 120 && p[2] > 180;
+        let paper = |p: [u8; 4]| p[0] > 240 && p[1] > 240 && p[2] > 240;
+        assert!(paper(page(&s, 1).pixel(50, 100)), "B alone does not show A's items");
+
+        let r = s.execute("layout.parents.options", &json!({"parent": "B", "basedOn": "A"})).unwrap();
+        assert_eq!(r, json!({"parent": "B-Opening", "basedOn": "A-Parent"}));
+        let img = page(&s, 1);
+        assert!(black(img.pixel(50, 100)), "A's item: {:?}", img.pixel(50, 100));
+        assert!(cyan(img.pixel(150, 150)), "B's item over A's: {:?}", img.pixel(150, 150));
+        assert!(paper(img.pixel(170, 20)), "the page's item over B's: {:?}", img.pixel(170, 20));
+        assert!(black(page(&s, 0).pixel(50, 100)) && !cyan(page(&s, 0).pixel(250, 100)), "page 1 uses A only");
+        // Parent B itself shows A's items under its own.
+        let mut rr = designcraft_render::Renderer::new();
+        rr.threads = 0;
+        let placed = [designcraft_render::Placed { spread: designcraft_doc::SpreadRef::Parent(1), xf: designcraft_geom::Affine::IDENTITY }];
+        let opts = designcraft_render::RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
+        let img = rr.render(&s.doc().unwrap().doc, &s.cache, &placed, 400, 400, designcraft_geom::Affine::IDENTITY, &opts);
+        assert!(black(img.pixel(50, 100)) && cyan(img.pixel(150, 150)), "{:?} {:?}", img.pixel(50, 100), img.pixel(150, 150));
+        let inspect = s.execute("document.inspect", &json!({})).unwrap();
+        assert_eq!(inspect["parents"][1]["basedOn"], "A-Parent");
+        assert_eq!(inspect["parents"][0]["basedOn"], Value::Null);
+
+        // Cycles are refused.
+        assert!(s.execute("layout.parents.options", &json!({"parent": "A", "basedOn": "B"})).is_err());
+        assert!(s.execute("layout.parents.options", &json!({"parent": "B", "basedOn": "B-Opening"})).is_err());
+        assert!(s.execute("layout.parents.options", &json!({"parent": "B", "basedOn": "Z"})).is_err());
+
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(paper(page(&s, 1).pixel(50, 100)), "undo clears Based on Parent");
+        s.execute("edit.redo", &json!({})).unwrap();
+        s.execute("layout.parents.options", &json!({"parent": "B", "basedOn": null})).unwrap();
+        assert_eq!(s.execute("document.inspect", &json!({})).unwrap()["parents"][1]["basedOn"], Value::Null);
+    }
+
+    /// A's page-number marker shown on parent XYZ (based on A) reads XYZ, as markers on XYZ's own items do.
+    #[test]
+    fn base_parent_markers_read_the_showing_parent() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 1, "facingPages": false})).unwrap();
+        s.execute("layout.parents.new", &json!({"prefix": "XYZ"})).unwrap();
+        s.execute("layout.parents.options", &json!({"parent": "XYZ", "basedOn": "A"})).unwrap();
+        let marker = designcraft_doc::story::PAGE_NUMBER.to_string();
+        let r = s
+            .execute("frame.create", &json!({"spread": {"kind": "parent", "index": 0}, "rect": [72, 30, 500, 60], "content": "text", "text": marker}))
+            .unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let sid = d.item(designcraft_doc::ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        let glyphs = |on| -> usize {
+            let cs = s.cache.get_on(&d, sid, on);
+            cs.frames.iter().flat_map(|f| f.lines.iter()).map(|l| l.glyphs.iter().filter(|g| g.visible && g.adv > 0.0).count()).sum()
+        };
+        assert_eq!(glyphs(designcraft_compose::ShownOn::Own), 1, "A");
+        assert_eq!(glyphs(designcraft_compose::ShownOn::Parent(1)), 3, "XYZ");
+    }
+
+    /// A file whose parents are based on each other opens, with the cycle broken and reported.
+    #[test]
+    fn opening_a_parent_cycle_breaks_it_with_a_warning() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({"pages": 1})).unwrap();
+        s.execute("layout.parents.new", &json!({"prefix": "B"})).unwrap();
+        let mut d = s.doc().unwrap().doc.as_ref().clone();
+        let (a, b) = (d.parents[0].id, d.parents[1].id);
+        std::sync::Arc::make_mut(&mut d.parents[0]).parent.as_mut().unwrap().based_on = Some(b);
+        std::sync::Arc::make_mut(&mut d.parents[1]).parent.as_mut().unwrap().based_on = Some(a);
+        let b64 = crate::cmd::base64_encode(&crate::cmd::to_bytes(&d).unwrap());
+        let r = s.execute("file.openBytes", &json!({"name": "cycle", "base64": b64})).unwrap();
+        assert!(r["warnings"].to_string().contains("cycle"), "{r}");
+        let d = &s.doc().unwrap().doc;
+        assert_eq!(d.parents[0].parent.as_ref().unwrap().based_on, None);
+        assert_eq!(d.parents[1].parent.as_ref().unwrap().based_on, Some(a));
+    }
+}
+
+#[cfg(test)]
+#[path = "parent_delete_tests.rs"]
+mod parent_delete_tests;
